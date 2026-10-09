@@ -1,7 +1,7 @@
 # jms-agent-bridge — Design
 
 **Date:** 2026-10-09
-**Status:** approved (v1)
+**Status:** implemented and verified against a live JumpServer (v4.10.18-ce)
 **Author:** lvyufeng
 
 ## Problem
