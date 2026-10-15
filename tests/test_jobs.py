@@ -16,12 +16,18 @@ def test_runner_exports_rank_wiring_for_collab():
     """Collaborative launch exports the shared rank/world env before the command."""
     from jms_bridge.jobs import _collab_exports
 
-    exports = _collab_exports(rank=2, nproc=8, world_size=16, master_addr="10.0.0.1", port=29400)
+    exports = _collab_exports(
+        rank=2, node_rank=1, nnodes=4, nproc=8, world_size=16, master_addr="10.0.0.1", port=29400
+    )
     assert "export JMS_RANK='2'" in exports
     assert "export JMS_WORLD_SIZE='16'" in exports
     assert "export JMS_NPROC='8'" in exports
     assert "export JMS_MASTER_ADDR='10.0.0.1'" in exports
     assert "export JMS_MASTER_PORT='29400'" in exports
+    # Node-level wiring is a *different* number from the device-level rank: torchrun
+    # takes the node count/ordinal, so `--nnodes=$JMS_WORLD_SIZE` was the bug.
+    assert "export JMS_NODE_RANK='1'" in exports
+    assert "export JMS_NNODES='4'" in exports
     # exports are injected before the user command
     script = build_runner_script("abcd1234", f"{exports}\ntorchrun train.py", None)
     assert script.index("JMS_WORLD_SIZE") < script.index("torchrun train.py")
@@ -145,6 +151,11 @@ def test_collab_assigns_ranks_in_order_over_nproc():
     assert "export JMS_RANK='8'" in runner.commands["b"]
     assert "export JMS_NPROC='2'" in runner.commands["b"]
     assert "export JMS_WORLD_SIZE='10'" in runner.commands["b"]
+    # Node ordinal counts *nodes*, not devices: host "b" is node 1 of 2, even though its
+    # first device is global rank 8. This is what `torchrun --node_rank` takes.
+    assert "export JMS_NODE_RANK='0'" in runner.commands["a"]
+    assert "export JMS_NODE_RANK='1'" in runner.commands["b"]
+    assert "export JMS_NNODES='2'" in runner.commands["b"]
 
 
 @pytest.mark.parametrize("bad", ["", "xyz", "deadbeef00", "../etc", "ABCD1234", "a;b"])

@@ -206,7 +206,20 @@ class Inventory:
                 "`examples/hosts.yaml` in the repo shows every supported field."
             )
         with p.open("rb") as fh:
-            data = yaml.safe_load(fh) or {}
+            try:
+                data = yaml.safe_load(fh) or {}
+            except yaml.YAMLError as exc:
+                # A hand-edited `hosts.yaml` with a bad indent is the single most likely
+                # way this file is wrong, and `yaml` raises `ParserError`, not our
+                # `InventoryError` — so the tool wrapper would hand the agent the opaque
+                # "Error executing tool <name>" instead of the line to fix.
+                raise InventoryError(f"{p} is not valid YAML: {exc}") from exc
+        if not isinstance(data, dict):
+            # `hosts:` as a list (or a bare scalar) parses fine but has no `.get`; say so
+            # here rather than dying later with an AttributeError.
+            raise InventoryError(
+                f"inventory {p} must be a mapping with a 'hosts:' key, got {type(data).__name__}"
+            )
 
         raw_hosts = data.get("hosts") or {}
         if not raw_hosts:

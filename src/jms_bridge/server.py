@@ -21,10 +21,11 @@ import os
 import re
 import subprocess
 from collections.abc import Callable
-from typing import Any, TypeVar
+from typing import Any, TypedDict, TypeVar
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
+from mcp.types import ToolAnnotations
 
 from . import __version__
 from .api import JumpServerAPI, JumpServerError
@@ -44,14 +45,141 @@ from .workspace import CONTAINER_RE, DEFAULT_CONTAINER, SOURCES
 
 log = logging.getLogger("jms_bridge.server")
 
+
+# --- structured output: the schemas a client sees ----------------------------------
+#
+# A tool's published `outputSchema` is derived from its return *annotation*, so these
+# TypedDicts exist to give the machine-readable tools a shape. They are deliberately
+# partial (``total=False``): the tools return a union of shapes — a success payload, a
+# refusal carrying `error`, or a guard return — and the schema's job is to make the
+# *predictable* fields known to a client, not to reject the rest. Pydantic drops any key
+# the schema does not mention, so a TypedDict that omits a field silently hides it from a
+# structured-output consumer; every key any branch of these tools can return must be
+# listed here.
+
+
+class _Refusal(TypedDict, total=False):
+    """The shape every tool falls back to when it refuses or matches no host."""
+
+    ok: bool
+    error: str
+
+
+class JobStatusOut(_Refusal, total=False):
+    """``jms_job_status``: one status dict per host, plus the per-host `ok`."""
+
+    status: list[dict]
+
+
+class ClusterPreflightOut(_Refusal, total=False):
+    """``jms_cluster_preflight``: readiness, world size and the busy gate."""
+
+    world_size_estimate: int
+    rendezvous: dict
+    heterogeneous: bool
+    islands: list[dict]
+    hosts: list[dict]
+    platforms: list[str]
+    busy_hosts: list[str]
+    note: str
+
+
+class DevRunOut(_Refusal, total=False):
+    """``jms_dev_run``: the cross-chip consistency table and its verification gates."""
+
+    ref: str
+    stage: str
+    columns: list[str]
+    rows: list[dict]
+    failed_hosts: list[str]
+    revisions: dict
+    revisions_consistent: bool
+    revisions_unverified: list[str]
+    attestation: dict
+    attestation_consistent: bool
+    attestation_diverged: list[str]
+    attestation_unverified: list[str]
+    hosts: dict
+    results: list[dict]
+
+
+class ClusterSubmitOut(_Refusal, total=False):
+    """``jms_cluster_submit``: the rendezvous, per-rank wiring and job id."""
+
+    command: str
+    rendezvous: dict
+    world_size: int
+    nnodes: int
+    # None on a refusal that never reached the launch (e.g. an empty selection).
+    job_id: str | None
+    ranks: list[dict]
+    islands: list[dict]
+    hint: str
+    unready: list[dict]
+    ready_targets: list[str]
+    busy: list[dict]
+
+
+class JobLogsOut(_Refusal, total=False):
+    """``jms_job_logs``: the incremental read and the resume point."""
+
+    host: str
+    job_id: str
+    offset: int
+    size: int
+    next_offset: int
+    log: str
+    exit_code: int
+
+
 # The version is what a client shows in `/mcp` and what a bug report quotes back, so it
 # has to be the installed package's, not the SDK default (an empty string).
-server = MCPServer("jms-agent-bridge", version=__version__)
+#
+# `instructions` is injected into the agent's context by most clients, and this surface is
+# wide with a non-obvious selector grammar — spelling the mental model out once here is
+# cheaper (and less error-prone) than hoping the agent infers it from the tool docstrings.
+# Keep it to what an agent must know *before* choosing a tool.
+_INSTRUCTIONS = """\
+JumpServer bridge for a heterogeneous accelerator fleet (Ascend/NVIDIA/domestic NPUs).
+
+Selector grammar: every `targets` / `workspace` argument takes host or workspace *names*,
+*group* names, or *tags*; `all` (or `*`) selects everything. An unmatched selector is an
+error, and an empty selection is never reported as success.
+
+Choosing a tool:
+- Long work (training) must go through `jms_submit_job` (same command on each host) or
+  `jms_cluster_submit` (one coordinated collective across hosts) — never `jms_exec`, which
+  is for short inspection commands and is bounded by its own timeout.
+- Before a distributed run: `jms_cluster_preflight` (readiness, world size, busy cards),
+  then `jms_cluster_plan` if the fleet is mixed-vendor — HCCL/NCCL islands cannot form one
+  collective and must federate.
+- Jobs are detached and answered by id: `jms_job_status` / `jms_job_logs` (poll with the
+  returned `next_offset`) / `jms_job_wait` (bounded; a timeout cancels nothing) /
+  `jms_cluster_cancel`.
+- After editing `hosts.yaml` or logging in, call `jms_inventory_reload` — the server caches
+  the inventory and credentials until you do.
+
+`jms_exec` / `jms_submit_job` / `jms_cluster_submit` / `jms_dev_run` refuse a command that
+matches a small destructive-pattern denylist unless `allow_dangerous=true`. That is a guard
+against obvious mistakes, not a security boundary — JumpServer's own policy is the backstop.
+"""
+
+server = MCPServer(
+    "jms-agent-bridge",
+    version=__version__,
+    title="JumpServer Bridge",
+    instructions=_INSTRUCTIONS,
+)
 
 _F = TypeVar("_F", bound=Callable[..., Any])
 
 
-def _tool() -> Callable[[_F], _F]:
+def _tool(
+    *,
+    read_only: bool = False,
+    destructive: bool = False,
+    idempotent: bool = False,
+) -> Callable[[_F], _F]:
     """``@server.tool()``, with setup failures turned into a readable ``ToolError``.
 
     ``ConfigError`` (no bastion URL, unreadable config) and ``InventoryError``
@@ -62,6 +190,11 @@ def _tool() -> Callable[[_F], _F]:
     uselessly, what a freshly-cloned-but-unconfigured checkout would see. Translating
     keeps the actionable message ("No inventory at …; run `jms-bridge init` or set
     JMS_BRIDGE_INVENTORY") in front of the agent.
+
+    The three flags become MCP ``ToolAnnotations``, which is how a client decides whether
+    to prompt the user. ``read_only`` is the useful one: a client may auto-approve a
+    read-only tool, so a session that only inspects the fleet stops asking. It must be
+    set honestly — a tool that changes remote state must not claim it.
     """
 
     def decorate(fn: _F) -> _F:
@@ -72,7 +205,13 @@ def _tool() -> Callable[[_F], _F]:
             except (ConfigError, InventoryError) as exc:
                 raise ToolError(str(exc)) from exc
 
-        return server.tool()(wrapper)  # type: ignore[return-value]
+        annotations = ToolAnnotations(
+            readOnlyHint=read_only,
+            destructiveHint=destructive,
+            idempotentHint=idempotent,
+            openWorldHint=True,  # every tool talks to a remote fleet
+        )
+        return server.tool(annotations=annotations)(wrapper)  # type: ignore[return-value]
 
     return decorate
 
@@ -137,7 +276,7 @@ def _empty_refusal(selectors: list[str], **empty: Any) -> dict[str, Any]:
 # --- control plane: discovery / audit / tickets -----------------------------------
 
 
-@_tool()
+@_tool(read_only=True)
 async def jms_list_assets(search: str | None = None) -> dict:
     """List the assets this account can reach in JumpServer.
 
@@ -167,7 +306,7 @@ async def jms_list_assets(search: str | None = None) -> dict:
     return {"ok": True, "count": len(out), "assets": out}
 
 
-@_tool()
+@_tool(read_only=True)
 async def jms_audit_query(
     asset_id: str | None = None, user: str | None = None, days: int = 5, limit: int = 30
 ) -> dict:
@@ -217,6 +356,19 @@ async def jms_create_ticket(
     "<uuid>", "apply_login_account": "root"}``.
     """
     api = _api()
+    # `fields` is spread into the payload alongside the named arguments, so a key that
+    # repeats one (`title`, `comment`, `org_id`, `type`) is a call that cannot be built.
+    # Left to Python it surfaces as a bare `TypeError` from inside the API method, which
+    # the SDK shows the agent as the opaque "Error executing tool jms_create_ticket".
+    collisions = sorted(set(fields or {}) & {"title", "comment", "org_id", "type"})
+    if collisions:
+        return {
+            "ok": False,
+            "error": (
+                f"fields may not repeat the named arguments {collisions}; "
+                "pass them as top-level tool arguments instead"
+            ),
+        }
     try:
         return {
             "ok": True,
@@ -235,7 +387,7 @@ async def jms_create_ticket(
 # --- data plane: probe / exec -----------------------------------------------------
 
 
-@_tool()
+@_tool(read_only=True)
 async def jms_probe(targets: list[str]) -> dict:
     """Probe hosts for liveness, accelerator type and driver/runtime version.
 
@@ -246,21 +398,34 @@ async def jms_probe(targets: list[str]) -> dict:
     hosts = _resolve(targets)
     if not hosts:
         return _empty_refusal(targets, hosts=[])
-    results = []
-    for host in hosts:
+
+    # A per-host raise becomes that host's entry, so one unreachable node does not erase
+    # the probe reply for the other 39 (the same isolation `_per_host` gives the job
+    # tools). The probe itself is a fan-out — sequential probing made a wide selector cost
+    # one round trip per host.
+    async def one(host: Host) -> dict:
         platform = host.platform_def
-        res = await _ssh().exec_on(host, platform.probe_cmd, timeout=45, workdir=False)
-        parsed = platform.parse_probe(res.stdout) if res.ok else {}
-        results.append(
-            {
+        try:
+            res = await _ssh().exec_on(host, platform.probe_cmd, timeout=45, workdir=False)
+        except Exception as exc:  # noqa: BLE001 - isolating one host is the point
+            return {
                 "host": host.name,
                 "platform": platform.name,
-                "ok": res.ok,
-                "exit_code": res.exit_code,
-                **parsed,
-                "stderr": res.stderr.strip()[:400] if not res.ok else "",
+                "ok": False,
+                "exit_code": None,
+                "stderr": f"{type(exc).__name__}: {exc}"[:400],
             }
-        )
+        parsed = platform.parse_probe(res.stdout) if res.ok else {}
+        return {
+            "host": host.name,
+            "platform": platform.name,
+            "ok": res.ok,
+            "exit_code": res.exit_code,
+            **parsed,
+            "stderr": res.stderr.strip()[:400] if not res.ok else "",
+        }
+
+    results = list(await asyncio.gather(*(one(h) for h in hosts)))
     return {"ok": all(r["ok"] for r in results), "hosts": results}
 
 
@@ -285,13 +450,13 @@ def _fleet_rollup(rows: list[dict]) -> dict:
     return {"by_platform": by, "unreachable": unreachable}
 
 
-@_tool()
+@_tool(read_only=True)
 async def jms_fleet_summary(targets: list[str], probe: bool = True) -> dict:
     """Roll up the selected fleet: how many hosts are reachable and how many
     accelerators they hold, grouped by platform.
 
-    ``targets`` are inventory selectors (names, groups, tags); the default of ``all``
-    covers the whole inventory. Reachability is proven by the ``jms-bridge-ok``
+    ``targets`` are inventory selectors (names, groups, tags); pass ``all`` to cover the
+    whole inventory. Reachability is proven by the ``jms-bridge-ok``
     sentinel coming back — a KoKo rejection (no permission, asset offline, bad address)
     exits **0** with the error on stdout, so trusting the exit code would count a dead
     asset as green. With ``probe`` on, each reachable host is also asked for its device
@@ -352,7 +517,7 @@ async def jms_fleet_summary(targets: list[str], probe: bool = True) -> dict:
     }
 
 
-@_tool()
+@_tool(destructive=True)
 async def jms_exec(
     targets: list[str], command: str, timeout: float = 60.0, allow_dangerous: bool = False
 ) -> dict:
@@ -378,7 +543,7 @@ async def jms_exec(
 # --- data plane: file sync --------------------------------------------------------
 
 
-@_tool()
+@_tool(destructive=True)
 async def jms_sync_push(
     targets: list[str],
     local: str,
@@ -399,7 +564,7 @@ async def jms_sync_push(
     return {"ok": all(r.ok for r in results), "results": [r.to_dict() for r in results]}
 
 
-@_tool()
+@_tool(idempotent=True)
 async def jms_sync_pull(
     targets: list[str], remote: str, local: str, excludes: list[str] | None = None
 ) -> dict:
@@ -471,7 +636,7 @@ def _artifact_subdir(name: str) -> str:
     return safe or "host"
 
 
-@_tool()
+@_tool(idempotent=True)
 async def jms_pull_artifacts(
     targets: list[str],
     remote: str,
@@ -544,7 +709,7 @@ async def _per_host(hosts: list[Host], fn: Callable[..., Any], *, key: str) -> l
 # --- data plane: jobs -------------------------------------------------------------
 
 
-@_tool()
+@_tool(destructive=True)
 async def jms_submit_job(targets: list[str], command: str, allow_dangerous: bool = False) -> dict:
     """Launch a long-running command (e.g. Torch-FL training) detached on each host.
 
@@ -576,8 +741,8 @@ async def jms_submit_job(targets: list[str], command: str, allow_dangerous: bool
     return {"ok": all(o["launched"] for o in out), "jobs": out}
 
 
-@_tool()
-async def jms_job_status(targets: list[str], job_id: str) -> dict:
+@_tool(read_only=True)
+async def jms_job_status(targets: list[str], job_id: str) -> JobStatusOut:
     """Check a job's status on each targeted host (status, exit code, log size, alive).
 
     `ok` is false when a targeted host could not be asked. A job that is merely
@@ -594,8 +759,10 @@ async def jms_job_status(targets: list[str], job_id: str) -> dict:
     return {"ok": all(r.get("ok") for r in results), "status": list(results)}
 
 
-@_tool()
-async def jms_job_logs(host: str, job_id: str, offset: int = 0, max_bytes: int = 65536) -> dict:
+@_tool(read_only=True)
+async def jms_job_logs(
+    host: str, job_id: str, offset: int = 0, max_bytes: int = 65536
+) -> JobLogsOut:
     """Read a job's log from `offset` onward. Poll with the returned `next_offset`."""
     bad = validate_job_id(job_id)
     if bad:
@@ -603,13 +770,16 @@ async def jms_job_logs(host: str, job_id: str, offset: int = 0, max_bytes: int =
     hosts = _resolve([host])
     if not hosts:
         return _empty_refusal([host], host=host, job_id=job_id)
-    return {
-        "ok": True,
-        **(await _jobs().logs(hosts[0], job_id, offset=offset, max_bytes=max_bytes)),
-    }
+    read = await _jobs().logs(hosts[0], job_id, offset=offset, max_bytes=max_bytes)
+    # `logs()` reports an empty `size=0` body for an unreachable host exactly as it does
+    # for a job that has not written a line yet, so the tool has to carry the read's own
+    # transport status or a dead host reads as "nothing new to read". `ok` therefore comes
+    # from the read itself (the same way `jms_job_cancel` takes it from `cancel()`), and
+    # the host-level entry keeps the tri-state DetailResult-style fields.
+    return {"ok": read.get("ok", False), **read}
 
 
-@_tool()
+@_tool(destructive=True, idempotent=True)
 async def jms_job_cancel(host: str, job_id: str) -> dict:
     """Kill a running job on one host."""
     bad = validate_job_id(job_id)
@@ -621,7 +791,7 @@ async def jms_job_cancel(host: str, job_id: str) -> dict:
     return {"ok": True, **(await _jobs().cancel(hosts[0], job_id))}
 
 
-@_tool()
+@_tool(read_only=True)
 async def jms_job_wait(
     targets: list[str], job_id: str, timeout: float = 150.0, interval: float = 2.0
 ) -> dict:
@@ -650,7 +820,7 @@ async def jms_job_wait(
     return {"ok": finished, "finished": finished, "job_id": job_id, "status": latest}
 
 
-@_tool()
+@_tool(read_only=True)
 async def jms_job_list(targets: list[str]) -> dict:
     """List the job ids currently running on each targeted host.
 
@@ -676,7 +846,7 @@ async def jms_job_list(targets: list[str]) -> dict:
     }
 
 
-@_tool()
+@_tool(destructive=True, idempotent=True)
 async def jms_cluster_cancel(targets: list[str], job_id: str) -> dict:
     """Stop every rank of one coordinated launch.
 
@@ -713,7 +883,7 @@ async def jms_cluster_cancel(targets: list[str], job_id: str) -> dict:
 # --- dev loop: workspace sync / run / logs -----------------------------------------
 
 
-@_tool()
+@_tool(idempotent=True)
 async def jms_inventory_reload() -> dict:
     """Re-read `hosts.yaml` (and the config) and drop everything cached from them.
 
@@ -869,7 +1039,7 @@ async def _deliver_one(ws, ref: str) -> dict:  # noqa: ANN001
     }
 
 
-@_tool()
+@_tool(destructive=True)
 async def jms_dev_sync(targets: list[str], ref: str) -> dict:
     """Deliver a git `ref` to every selected workspace's container.
 
@@ -888,14 +1058,14 @@ async def jms_dev_sync(targets: list[str], ref: str) -> dict:
     }
 
 
-@_tool()
+@_tool(destructive=True, idempotent=True)
 async def jms_dev_run(
     targets: list[str],
     ref: str,
     timeout: float = 600.0,
     ut_cmd: str | None = None,
     allow_dangerous: bool = False,
-) -> dict:
+) -> DevRunOut:
     """Deliver `ref` to every workspace, run the UT suite in each container, and
     return ONE cross-chip consistency table.
 
@@ -1084,14 +1254,30 @@ async def jms_dev_run(
     return table
 
 
-@_tool()
+@_tool(idempotent=True)
 async def jms_dev_logs(workspace: str, test_id: str, timeout: float = 300.0) -> dict:
     """Full output for one `test_id` on one `workspace` (drill into a FAIL).
 
     Re-runs just that test in the container with a full traceback, so it works for
     any suite without depending on a saved report file.
     """
-    ws = _inv().resolve_workspaces([workspace])[0]
+    candidates = _inv().resolve_workspaces([workspace])
+    if len(candidates) != 1:
+        # `resolve_workspaces` treats a selector as a union, so a *tag* can match many
+        # workspaces. Silently drilling into the first would answer about a different
+        # chip than the one whose FAIL the caller meant to investigate — so an ambiguous
+        # selector is refused by name, and the caller picks one.
+        return {
+            "ok": False,
+            "workspace": workspace,
+            "test_id": test_id,
+            "error": (
+                f"{workspace!r} matched {len(candidates)} workspaces "
+                f"({sorted(w.name for w in candidates)}); name exactly one"
+            ),
+            "matched": sorted(w.name for w in candidates),
+        }
+    ws = candidates[0]
     host = _host_of(ws)
     # Activate the container env *before* the repo `cd`, exactly as jms_dev_run does.
     # The whole point of this tool is to say why a test failed on a chip; re-running
@@ -1120,7 +1306,7 @@ async def jms_dev_logs(workspace: str, test_id: str, timeout: float = 300.0) -> 
     }
 
 
-@_tool()
+@_tool(read_only=True)
 async def jms_dev_discover(
     targets: list[str],
     container: str = DEFAULT_CONTAINER,
@@ -1176,6 +1362,20 @@ async def jms_dev_discover(
         return {"ok": False, "error": "source 'push' requires both 'mount' and 'local'"}
 
     hosts = _resolve(targets)
+    if not hosts:
+        # Nothing was inspected, which is not "every requested host produced a
+        # workspace": say so in the tool's own shape (as the other fan-outs do) so the
+        # caller can tell an empty selection from a discovery that found nothing.
+        return _empty_refusal(
+            targets,
+            container=container,
+            source=source,
+            hosts=[],
+            skipped=[],
+            warnings=[],
+            workspaces=[],
+            yaml="",
+        )
     script = build_discovery_script(container, repo_match=repo_match, max_depth=max_depth)
     results = await asyncio.gather(
         *(
@@ -1222,8 +1422,10 @@ async def jms_dev_discover(
 # --- cluster: preflight + coordinated launch ---------------------------------------
 
 
-@_tool()
-async def jms_cluster_preflight(targets: list[str], port: int = DEFAULT_RDZV_PORT) -> dict:
+@_tool(read_only=True)
+async def jms_cluster_preflight(
+    targets: list[str], port: int = DEFAULT_RDZV_PORT
+) -> ClusterPreflightOut:
     """Check a cluster is ready for a distributed run, host by host.
 
     For every host: reachability, accelerator visibility and version (via the
@@ -1281,7 +1483,7 @@ _FEDERATION_NOTE = (
 )
 
 
-@_tool()
+@_tool(read_only=True)
 async def jms_cluster_plan(targets: list[str], port: int = DEFAULT_RDZV_PORT) -> dict:
     """Plan a federated layout for a target set, grouped by collective engine.
 
@@ -1324,7 +1526,7 @@ async def jms_cluster_plan(targets: list[str], port: int = DEFAULT_RDZV_PORT) ->
     }
 
 
-@_tool()
+@_tool(destructive=True)
 async def jms_cluster_submit(
     targets: list[str],
     command: str,
@@ -1332,26 +1534,34 @@ async def jms_cluster_submit(
     port: int = DEFAULT_RDZV_PORT,
     allow_busy: bool = False,
     allow_dangerous: bool = False,
-) -> dict:
+) -> ClusterSubmitOut:
     """Launch ONE coordinated distributed job across a heterogeneous cluster.
 
     Unlike `jms_submit_job` (which runs the command independently on each host),
     this assigns every host a rank and gives them a shared rendezvous, exporting
-    `JMS_RANK`, `JMS_LOCAL_RANK`, `JMS_NPROC`, `JMS_WORLD_SIZE`, `JMS_MASTER_ADDR`
-    and `JMS_MASTER_PORT` before `command` runs. All ranks launch concurrently and
-    the call returns immediately with **one** job id, shared by every rank — pass it
-    (and the same `targets`) to `jms_job_status` / `jms_job_wait` / `jms_job_logs` /
+    `JMS_RANK` (global device rank), `JMS_NODE_RANK` / `JMS_NNODES` (node ordinal and
+    node count), `JMS_NPROC`, `JMS_WORLD_SIZE`, `JMS_MASTER_ADDR` and `JMS_MASTER_PORT`
+    before `command` runs. All ranks launch concurrently and the call returns
+    immediately with **one** job id, shared by every rank — pass it (and the same
+    `targets`) to `jms_job_status` / `jms_job_wait` / `jms_job_logs` /
     `jms_cluster_cancel`.
 
     `command` is your per-node launcher; wire it with the exported env. For torchrun:
 
-        torchrun --nnodes=$JMS_WORLD_SIZE --node_rank=$JMS_RANK \\
+        torchrun --nnodes=$JMS_NNODES --node_rank=$JMS_NODE_RANK \\
                  --nproc_per_node=$JMS_NPROC \\
                  --rdzv_endpoint=$JMS_MASTER_ADDR:$JMS_MASTER_PORT \\
                  train.py --rounds 100
 
+    (Use `JMS_NNODES` / `JMS_NODE_RANK` for `torchrun`: those are node counts, whereas
+    `JMS_WORLD_SIZE` / `JMS_RANK` count *devices*. A 2-node, 2-chip run is `nnodes=2`,
+    not `nnodes=4`.)
+
     `targets` order defines rank order; each host contributes one rank node whose
-    `JMS_NPROC` is its accelerator count. Every target is preflighted first, and a host
+    `JMS_NPROC` is its accelerator count. A single host is allowed — that is the
+    one-island case `jms_cluster_plan` emits for a mixed cluster (e.g. a lone Ascend
+    box federating with a CUDA island) — and launches one rank node. Every target is
+    preflighted first, and a host
     that is unreachable, holding a stale rendezvous `port`, or already running work on
     its accelerators fails the call rather than being handed a rank. The busy gate is
     what stops a second training being co-scheduled onto cards that are already in use;
@@ -1367,11 +1577,8 @@ async def jms_cluster_submit(
             "command": command,
         }
     hosts = _resolve(targets)
-    if len(hosts) < 2:
-        return {
-            "ok": False,
-            "error": "cluster submit needs at least 2 hosts; use jms_submit_job for one",
-        }
+    if not hosts:
+        return _empty_refusal(targets, job_id=None, rendezvous={}, world_size=0, ranks=[])
     if is_heterogeneous(hosts):
         islands = plan_islands(hosts)
         return {
@@ -1408,10 +1615,7 @@ async def jms_cluster_submit(
             ),
             "unready": [health[h.name].to_dict() for h in unready],
             "ready_targets": [h.name for h in hosts if health[h.name].ok],
-            "hint": (
-                "fix the hosts above, or submit the ready subset by name — "
-                "jms_cluster_submit needs at least 2 hosts"
-            ),
+            "hint": "fix the hosts above, or submit the ready subset by name",
         }
     # Busy is a *separate* gate from `ok`, and it is the one that keeps two trainings off
     # the same cards. It stays out of `HostHealth.ok` because the two failures need
@@ -1442,17 +1646,22 @@ async def jms_cluster_submit(
         "ok": len(handles) == len(hosts),
         "rendezvous": rdv.to_dict(),
         "world_size": world_size,
+        # The node ordinal / node count a `torchrun`-style launcher takes, as opposed to
+        # the device-level `world_size` above. Hoisted so a caller can read the wiring
+        # without re-deriving it from the rank list.
+        "nnodes": len(assignments),
         # Every rank shares one job id (`submit_collab`), so it is hoisted out of the
         # per-rank entries and repeated here for convenience.
         "job_id": handles[0].job_id if handles else None,
         "ranks": [
             {
                 "host": h.name,
+                "node_rank": i,
                 "job_id": by_host.get(h.name),
                 "nproc": n,
                 "launched": h.name in by_host,
             }
-            for h, n in assignments
+            for i, (h, n) in enumerate(assignments)
         ],
     }
 

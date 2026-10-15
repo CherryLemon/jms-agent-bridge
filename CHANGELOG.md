@@ -4,6 +4,21 @@
 
 ### Added
 
+- **Every tool now carries MCP annotations, and the server publishes instructions.** All
+  24 tools previously shipped `annotations: null`, so a client had no way to tell an
+  inspection call from one that spawns or kills work. The eleven read-only tools
+  (`jms_list_assets`, `jms_audit_query`, `jms_probe`, `jms_fleet_summary`,
+  `jms_job_status`, `jms_job_logs`, `jms_job_wait`, `jms_job_list`, `jms_dev_discover`,
+  `jms_cluster_preflight`, `jms_cluster_plan`) now set `readOnlyHint`, which lets a client
+  auto-approve them; the tools that mutate remote state set `destructiveHint`. A test pins
+  the read-only set in both directions, because "this tool only reads" is a safety claim.
+  A top-level `instructions` string (plus a `title`) now states the selector grammar and
+  which tool to reach for; most clients inject it into the agent's context.
+- **Five tools declare a structured `outputSchema`.** `jms_job_status`, `jms_job_logs`,
+  `jms_cluster_preflight`, `jms_cluster_submit` and `jms_dev_run` return TypedDicts instead
+  of an untyped `dict`, so a client can validate and render the payload instead of guessing
+  at fields. The schemas are partial by design, and a test asserts each one still lists the
+  keys its tool actually returns.
 - **DeepSeek Harness (dsh) is now a documented, verified MCP client.** The bridge already
   spoke plain stdio MCP, so no code changed — what was missing was the registration path,
   which is unlike Claude Code's and Codex's: dsh has no `mcp add` and registers a server by
@@ -31,6 +46,43 @@
 
 ### Fixed
 
+- **`jms_job_logs` reported `ok: true` on a host it never read.** An unreachable host
+  returns an empty body, indistinguishable from a job that has not logged yet, so the tool
+  hard-coded a green that was really "we learned nothing". `JobManager.logs` now reports
+  the read's own transport status (`ok`, `exit_code`, `error`), and the tool forwards it —
+  matching `jms_job_cancel`, which already took its `ok` from the operation.
+- **A malformed `config.toml` / `hosts.yaml` reached the agent as an opaque tool error.**
+  The `_tool()` wrapper only translates `ConfigError` / `InventoryError`, but a typo made
+  the raw `TOMLDecodeError` / `yaml.ParserError` escape — so *every* tool degraded to
+  "Error executing tool <name>" at once, for the most ordinary mistake there is.
+  `read_toml` and `Inventory.load` now translate parse failures (and a non-mapping
+  inventory) into their domain errors, with the file path and the parser's line.
+- **`jms_cluster_submit` refused the single-host island its own docs told you to submit.**
+  The gate required two hosts, but `jms_cluster_plan` emits one-node islands for a mixed
+  cluster and the README's federation walkthrough submits the lone Ascend box on its own.
+  A single host is now a valid submit (one rank node); an empty selection is refused with
+  the usual "matched no host".
+- **The documented `torchrun` recipe conflated device rank with node ordinal.** Ranks were
+  exported as `JMS_RANK` (global *device* rank) and `JMS_WORLD_SIZE` (total *devices*),
+  while the README and tool docstring used them for `--node_rank` / `--nnodes`. A 2-node,
+  2-chip run therefore asked for `--nnodes=4 --node_rank=2` — four nodes that do not exist
+  and an ordinal that is not a node. `JMS_NODE_RANK` and `JMS_NNODES` are now exported
+  alongside the device-level pair, and every example uses the node-level ones.
+- **`jms_probe` probed its hosts sequentially.** Its docstring promised a parallel fan-out
+  and every other fan-out in the file uses `gather`; a 40-host probe paid 40 SSH round
+  trips in series. It is now concurrent and isolates a host that raises, so one bad node no
+  longer erases the other hosts' results.
+- **`jms_dev_logs` silently drilled into the first workspace a tag matched.**
+  `resolve_workspaces` treats a selector as a union, so a tag could match several chips and
+  the tool answered about an arbitrary one. An ambiguous selector is now refused by name.
+- **`jms_create_ticket` turned a `fields` collision into a bare `TypeError`.** `fields` is
+  spread beside `title` / `comment` / `org_id`, so a repeated key raised from inside the API
+  call and surfaced as "Error executing tool jms_create_ticket". The collision is now a
+  readable refusal naming the keys.
+- **`jms_dev_discover` on an empty selection gave no reason.** It returned `ok: false` with
+  no `error`, unlike every other fan-out; it now says the selectors matched no host.
+- **`jms_fleet_summary` claimed an `all` default it does not have.** `targets` is required;
+  the docstring said "the default of `all`". It now says pass `all`.
 - **`doctor`'s data-plane handler caught `(InventoryError, Exception)`.** `InventoryError`
   derives from `Exception`, so the first element was dead weight that read as though a
   narrower case were handled separately. It is now `except Exception`, with the same

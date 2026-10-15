@@ -385,6 +385,15 @@ otherwise the bridge starts up holding a token the server may no longer accept.
 Selectors accept host names, group names, or tags — `["cluster"]`, `["gpu"]`, `["all"]`. The
 `jms_dev_*` tools instead select **workspaces** by name, tag, or `all`.
 
+Every tool carries MCP **annotations**: the read-only tools (`jms_list_assets`, `jms_audit_query`,
+`jms_probe`, `jms_fleet_summary`, `jms_job_status`, `jms_job_logs`, `jms_job_wait`, `jms_job_list`,
+`jms_dev_discover`, `jms_cluster_preflight`, `jms_cluster_plan`) set `readOnlyHint`, so a client
+that honours it can skip its approval prompt for them. The tools that spawn, kill or overwrite
+something set `destructiveHint` instead. The server also publishes a top-level `instructions`
+string spelling out the selector grammar and which tool to reach for — most clients inject it into
+the agent's context. Five tools (`jms_job_status`, `jms_job_logs`, `jms_cluster_preflight`,
+`jms_cluster_submit`, `jms_dev_run`) additionally declare a structured `outputSchema`.
+
 ## Usage
 
 ### A Torch-FL run, end to end
@@ -412,11 +421,11 @@ single `world_size=N` job.
 jms_cluster_preflight(["cluster"])              # ready? world_size estimate, port free, cards free?
 jms_cluster_submit(
   ["ascend-910c", "node-4090-1", "node-4090-2"],
-  "torchrun --nnodes=$JMS_WORLD_SIZE --node_rank=$JMS_RANK "
+  "torchrun --nnodes=$JMS_NNODES --node_rank=$JMS_NODE_RANK "
   "--nproc_per_node=$JMS_NPROC "
   "--rdzv_endpoint=$JMS_MASTER_ADDR:$JMS_MASTER_PORT train.py --rounds 100",
 )
-# -> {job_id, rendezvous, world_size, ranks:[...]}   (one id for every rank)
+# -> {job_id, rendezvous, world_size, nnodes, ranks:[...]}   (one id for every rank)
 jms_cluster_cancel(["ascend-910c", "node-4090-1", "node-4090-2"], "<job-id>")
 ```
 
@@ -431,11 +440,21 @@ All ranks of one `jms_cluster_submit` share a **single job id**, so `jms_job_sta
 `jms_job_wait`, `jms_job_logs` and `jms_cluster_cancel` each take that one id rather than a
 rank-to-host pairing.
 
-Each rank gets `JMS_RANK`, `JMS_LOCAL_RANK`, `JMS_NPROC`, `JMS_WORLD_SIZE`, `JMS_MASTER_ADDR`,
-`JMS_MASTER_PORT` exported before its command. The bridge supplies the rank/world wiring (the part
-that must be identical across nodes); you supply the launcher. Note: ranks talk to each other
-**directly** over the rendezvous, not through the bastion — so `master_addr` must be the host's
-own reachable address (set `address:` in `hosts.yaml`), and all nodes must be mutually routable.
+Each rank node gets two different rank notions exported before its command — they are not
+interchangeable, and mixing them up was a real bug:
+
+- `JMS_RANK` / `JMS_LOCAL_RANK` / `JMS_WORLD_SIZE` are **device-level**: `JMS_RANK` is this node's
+  first global device rank, `JMS_WORLD_SIZE` the total device count. `JMS_LOCAL_RANK` is `0` (the
+  bridge launches one launcher per node; a `torchrun`-style launcher sets per-device local ranks
+  itself).
+- `JMS_NODE_RANK` / `JMS_NNODES` are **node-level** — the ordinal and count that
+  `torchrun --node_rank` / `--nnodes` take. A 2-node, 2-chip run is `nnodes=2`, not `nnodes=4`.
+
+`JMS_NPROC`, `JMS_MASTER_ADDR` and `JMS_MASTER_PORT` complete the wiring. The bridge supplies it
+(the part that must be identical across nodes); you supply the launcher. Note: ranks talk to each
+other **directly** over the rendezvous, not through the bastion — so `master_addr` must be the
+host's own reachable address (set `address:` in `hosts.yaml`), and all nodes must be mutually
+routable.
 
 ### Heterogeneous clusters — islands and federation
 
@@ -456,9 +475,13 @@ jms_cluster_plan(["cluster"])
 #    ]
 
 # then one coordinated job per island (they form their own collectives):
-jms_cluster_submit(["node-4090-1", "node-4090-2"], "torchrun --nnodes=2 --node_rank=$JMS_RANK ...")
-jms_cluster_submit(["ascend-910c"],             "torchrun --nnodes=1 --node_rank=0 ...")
+jms_cluster_submit(["node-4090-1", "node-4090-2"], "torchrun --nnodes=$JMS_NNODES --node_rank=$JMS_NODE_RANK ...")
+jms_cluster_submit(["ascend-910c"],                "torchrun --nnodes=1 --node_rank=0 ...")
 ```
+
+A one-host island is a legitimate submit: `jms_cluster_submit` accepts a single host (it does not
+require two), which is exactly what the mixed-cluster walkthrough above does for the lone Ascend
+box.
 
 The island *exchange* (all-reduce across islands, or a parameter server) is application logic you
 write in the training script; the bridge gives each island its launch and rendezvous. For a plain

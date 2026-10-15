@@ -128,11 +128,23 @@ def credentials_path(path: str | Path | None = None) -> Path:
 
 
 def read_toml(path: Path) -> dict:
-    """Parse a TOML file into a dict, returning ``{}`` when it does not exist."""
+    """Parse a TOML file into a dict, returning ``{}`` when it does not exist.
+
+    A malformed file raises :class:`ConfigError`, not the parser's own
+    ``TOMLDecodeError``: the MCP tool wrapper only translates ``ConfigError`` /
+    ``InventoryError`` into a readable message, so letting the raw parser exception
+    through would reach the agent as an opaque "Error executing tool <name>" for the
+    most ordinary mistake there is — a typo in a hand-edited config.
+    """
     if not path.exists():
         return {}
-    with path.open("rb") as fh:
-        return tomllib.load(fh)
+    try:
+        with path.open("rb") as fh:
+            return tomllib.load(fh)
+    except tomllib.TOMLDecodeError as exc:
+        raise ConfigError(f"{path} is not valid TOML: {exc}") from exc
+    except OSError as exc:
+        raise ConfigError(f"cannot read {path}: {exc}") from exc
 
 
 def load_config(path: str | Path | None = None) -> BastionConfig:

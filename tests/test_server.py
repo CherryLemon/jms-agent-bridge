@@ -68,6 +68,114 @@ def test_mcp_server_lists_all_tools():
     # `MCPServer(name)` hands back.
     assert info.server_info.name == "jms-agent-bridge"
     assert info.server_info.version == __version__, "serverInfo.version must be the package's"
+    assert info.instructions, "instructions must be set; clients inject them into context"
+
+
+#: Tools that only read remote/client state. A client may auto-approve these based on the
+#: MCP `readOnlyHint`, so the list is pinned: mislabelling a mutating tool as read-only
+#: would let it run unattended.
+_READ_ONLY_TOOLS = {
+    "jms_list_assets",
+    "jms_audit_query",
+    "jms_probe",
+    "jms_fleet_summary",
+    "jms_job_status",
+    "jms_job_logs",
+    "jms_job_wait",
+    "jms_job_list",
+    "jms_dev_discover",
+    "jms_cluster_preflight",
+    "jms_cluster_plan",
+}
+
+
+def test_every_tool_declares_annotations_and_the_read_only_set_is_exact():
+    """Every tool advertises MCP annotations, and `readOnlyHint` matches reality.
+
+    A client uses `readOnlyHint` to decide whether to prompt the user, so the set of
+    read-only tools is a safety claim, not documentation: it is asserted both ways.
+    """
+    tools = {t.name: t for t in asyncio.run(S.server.list_tools())}
+    assert tools, "the server registered no tools"
+
+    for name, tool in tools.items():
+        assert tool.annotations is not None, f"{name} has no annotations"
+        # Every tool reaches a remote fleet, so the default is asserted too.
+        assert tool.annotations.open_world_hint is True
+
+    actual_read_only = {
+        name for name, t in tools.items() if t.annotations.read_only_hint is True
+    }
+    assert actual_read_only == _READ_ONLY_TOOLS, (
+        f"read-only set drifted: extra={actual_read_only - _READ_ONLY_TOOLS}, "
+        f"missing={_READ_ONLY_TOOLS - actual_read_only}"
+    )
+    # A read-only tool must never also claim to be destructive.
+    for name in _READ_ONLY_TOOLS:
+        assert tools[name].annotations.destructive_hint is False
+
+
+#: Tools that publish a machine-readable `outputSchema`, with the fields a caller is
+#: guaranteed to be able to read. Pinning these keeps a schema from silently dropping a
+#: key the tool actually returns: the SDK validates the result against the schema, and a
+#: field the schema omits disappears from the structured content a client consumes.
+_STRUCTURED_TOOLS = {
+    "jms_job_status": {"ok", "status", "error"},
+    "jms_job_logs": {"ok", "host", "job_id", "offset", "size", "next_offset", "log", "error"},
+    "jms_cluster_preflight": {"ok", "world_size_estimate", "rendezvous", "hosts", "error"},
+    "jms_cluster_submit": {"ok", "rendezvous", "world_size", "nnodes", "job_id", "ranks", "error"},
+    "jms_dev_run": {"ok", "rows", "columns", "revisions_consistent", "error"},
+}
+
+
+def test_structured_tools_publish_the_fields_they_return():
+    """Tools with a declared output schema must expose every key they can return."""
+    tools = {t.name: t for t in asyncio.run(S.server.list_tools())}
+    for name, required in _STRUCTURED_TOOLS.items():
+        schema = tools[name].output_schema
+        assert schema is not None, f"{name} lost its output schema"
+        props = set(schema.get("properties", {}))
+        missing = required - props
+        assert not missing, f"{name} schema omits {sorted(missing)}"
+
+
+def test_structured_and_unstructured_tools_both_still_work(monkeypatch):
+    """A schema must not change the payload a caller receives.
+
+    The SDK validates structured output against the schema and strips unknown keys from
+    the *structured* copy; the human-readable JSON text must still carry everything, so a
+    client that reads text (or an older client) sees the same reply as before.
+    """
+    _lifecycle_install(monkeypatch, ["a"])
+    r = asyncio.run(S.jms_job_status(["a"], "abcd1234"))
+    assert r["ok"] is True and r["status"][0]["host"] == "a"
+
+
+def test_structured_tools_survive_their_refusal_paths(monkeypatch):
+    """Every refusal branch must validate against the published schema.
+
+    The SDK validates a structured result against its schema, so a field the schema types
+    too narrowly (a refusal returning `job_id: None` for a `str`) turns a normal "matched
+    no host" reply into the opaque "Error executing tool <name>". Driving each refusal
+    through `call_tool` is what catches that.
+    """
+    inv = Inventory(
+        hosts={"x": Host(name="x", login="u", asset_id="A")}, groups={}, workspaces={}
+    )
+    monkeypatch.setitem(S._state, "inv", inv)
+    _lifecycle_install(monkeypatch, [])
+    monkeypatch.setitem(S._state, "inv", inv)
+
+    calls = [
+        ("jms_job_status", {"targets": [], "job_id": "abcd1234"}),
+        ("jms_cluster_preflight", {"targets": []}),
+        ("jms_cluster_submit", {"targets": [], "command": "echo hi"}),
+        ("jms_dev_run", {"targets": [], "ref": "main"}),
+    ]
+    for name, args in calls:
+        res = asyncio.run(S.server.call_tool(name, args))
+        assert res.structured_content is not None, f"{name} produced no structured content"
+        assert res.structured_content["ok"] is False, f"{name} did not report a refusal"
 
 
 def test_readme_tool_count_matches_the_registered_surface():
@@ -517,6 +625,29 @@ def test_dev_logs_without_env_setup_cds_straight_into_the_repo(monkeypatch):
     assert "/work/Torch-FL" in inner
 
 
+def test_dev_logs_refuses_an_ambiguous_selector_instead_of_guessing(monkeypatch):
+    """A tag matching several workspaces must not silently drill into the first.
+
+    `resolve_workspaces` treats a selector as a union, so `jms_dev_logs("ascend", ...)`
+    can match many chips. Picking one silently answers about a different chip than the
+    caller meant, so the ambiguity is refused by name.
+    """
+    fake = _install(
+        monkeypatch,
+        [_ws("a", "h1"), _ws("b", "h2")],
+        {"pytest": (0, "1 passed", "")},
+    )
+    # `_ws` tags both workspaces "ascend"; either way the union is ambiguous.
+    _state_inv = S._state["inv"]
+    for w in _state_inv.workspaces.values():
+        w.tags = ["ascend"]
+    r = asyncio.run(S.jms_dev_logs("ascend", "tests/unit/test_softmax.py::test_x"))
+    assert r["ok"] is False
+    assert "matched 2 workspaces" in r["error"]
+    assert r["matched"] == ["a", "b"]
+    assert fake.calls == []  # nothing was run against the wrong chip
+
+
 def test_dev_sync_git_reports_the_sha_the_container_landed_on(monkeypatch):
     fake = _install(monkeypatch, [_ws("a", "h1")], {"git fetch": (0, "abc1234\n", "")})
     r = asyncio.run(S.jms_dev_sync(["all"], "main"))
@@ -585,6 +716,30 @@ def test_job_logs_tool_surfaces_the_next_offset(monkeypatch):
     assert r["ok"] is True
     assert r["size"] == 100000
     assert r["next_offset"] == 10
+
+
+def test_job_logs_tool_is_not_green_when_the_host_was_never_read(monkeypatch):
+    """An unreachable host must not read as a clean, empty log.
+
+    `tail` on a host that was never reached yields the same empty body as a job that
+    has not logged yet, so the tool has to carry the read's transport status. Reporting
+    `ok: true` here is the "vacuous green" the rest of the surface guards against.
+    """
+    from jms_bridge.jobs import JobManager
+
+    class _DeadRunner:
+        async def exec_on(self, host, command, *, timeout=60, workdir=True):
+            return ExecResult(host.name, 255, "", "ssh: connect to host h1 refused")
+
+    inv = Inventory(
+        hosts={"h1": Host(name="h1", login="u", asset_id="A")}, groups={}, workspaces={}
+    )
+    monkeypatch.setitem(S._state, "inv", inv)
+    monkeypatch.setitem(S._state, "jobs", JobManager(_DeadRunner()))
+    r = asyncio.run(S.jms_job_logs("h1", "deadbeef"))
+    assert r["ok"] is False
+    assert r["log"] == "" and r["size"] == 0
+    assert "refused" in r["error"]
 
 
 # --- jms_dev_discover ---------------------------------------------------------------
@@ -787,6 +942,30 @@ def test_cluster_submit_ranks_every_ready_host(monkeypatch):
     assert all(x["launched"] and x["nproc"] == 2 for x in r["ranks"])
     assert jobs.collab[0]["assignments"] == [("a", 2), ("b", 2)]
     assert jobs.collab[0]["world_size"] == 4
+    # Node-level wiring is hoisted for the caller and is *not* the device-level count.
+    assert r["nnodes"] == 2
+    assert [x["node_rank"] for x in r["ranks"]] == [0, 1]
+
+
+def test_cluster_submit_allows_a_single_host_island(monkeypatch):
+    """A one-host island is exactly what `jms_cluster_plan` emits for a mixed cluster.
+
+    README's federation walkthrough submits the lone Ascend island on its own, so the
+    tool must not refuse the single node the plan just told the caller to launch.
+    """
+    _, jobs = _cluster_install(monkeypatch, ["solo"], {})
+    r = asyncio.run(S.jms_cluster_submit(["solo"], "torchrun train.py"))
+    assert r["ok"] is True
+    assert r["nnodes"] == 1 and r["world_size"] == 2  # the host's 2 chips
+    assert [x["node_rank"] for x in r["ranks"]] == [0]
+    assert jobs.collab[0]["assignments"] == [("solo", 2)]
+
+
+def test_cluster_submit_on_an_empty_selection_is_not_success(monkeypatch):
+    _, jobs = _cluster_install(monkeypatch, [], {})
+    r = asyncio.run(S.jms_cluster_submit([], "torchrun train.py"))
+    assert r["ok"] is False and "matched no host" in r["error"]
+    assert jobs.collab == []
 
 
 def test_cluster_submit_refuses_to_rank_an_unreachable_host(monkeypatch):
@@ -1134,6 +1313,70 @@ def test_probe_on_an_empty_selection_is_not_success(monkeypatch):
     assert fake.calls == []  # nothing was executed
 
 
+def test_probe_fans_out_concurrently(monkeypatch):
+    """A probe over N hosts must be one round trip of wall clock, not N.
+
+    The docstring promises a parallel fan-out, and a wide selector paying one sequential
+    SSH round trip per host is the difference between a quick check and a timeout.
+    """
+    hosts = [Host(name=f"h{i}", login="u", asset_id="A") for i in range(4)]
+
+    class _SlowSSH(_FakeSSH):
+        def __init__(self):
+            super().__init__({})
+            self.in_flight = 0
+            self.max_in_flight = 0
+
+        async def exec_on(self, host, command, *, timeout=60.0, workdir=True, env_setup=True):
+            self.in_flight += 1
+            self.max_in_flight = max(self.max_in_flight, self.in_flight)
+            await asyncio.sleep(0.02)
+            self.in_flight -= 1
+            return ExecResult(host.name, 0, "GPU 0\n", "")
+
+    inv = Inventory(hosts={h.name: h for h in hosts}, groups={}, workspaces={})
+    fake = _SlowSSH()
+    monkeypatch.setitem(S._state, "inv", inv)
+    monkeypatch.setitem(S._state, "ssh", fake)
+    r = asyncio.run(S.jms_probe(["all"]))
+    assert r["ok"] is True and len(r["hosts"]) == 4
+    assert fake.max_in_flight > 1, "probes were issued sequentially"
+
+
+def test_probe_isolates_a_host_that_raises(monkeypatch):
+    """One host's transport error must not erase the other hosts' probe results."""
+    hosts = [Host(name=n, login="u", asset_id="A") for n in ("a", "b")]
+
+    class _ExplodingSSH(_FakeSSH):
+        async def exec_on(self, host, command, *, timeout=60.0, workdir=True, env_setup=True):
+            if host.name == "b":
+                raise RuntimeError("ssh binary vanished")
+            return ExecResult(host.name, 0, "GPU 0\n", "")
+
+    inv = Inventory(hosts={h.name: h for h in hosts}, groups={}, workspaces={})
+    monkeypatch.setitem(S._state, "inv", inv)
+    monkeypatch.setitem(S._state, "ssh", _ExplodingSSH({}))
+    r = asyncio.run(S.jms_probe(["all"]))
+    assert [h["host"] for h in r["hosts"]] == ["a", "b"]
+    assert r["ok"] is False
+    assert "ssh binary vanished" in r["hosts"][1]["stderr"]
+    assert r["hosts"][0]["ok"] is True
+
+
+def test_dev_discover_on_an_empty_selection_says_why(monkeypatch):
+    """An empty selection must carry an error, not just `ok: false`.
+
+    Discovery reports `ok` as "every requested host produced a workspace", so a call
+    that inspected nothing needs to say that in the tool's own shape.
+    """
+    fake = _install_hosts(monkeypatch, [], {})
+    r = asyncio.run(S.jms_dev_discover([]))
+    assert r["ok"] is False
+    assert "matched no host" in r["error"]
+    assert r["hosts"] == [] and r["workspaces"] == [] and r["yaml"] == ""
+    assert fake.calls == []
+
+
 def test_exec_on_an_empty_selection_is_not_success(monkeypatch):
     fake = _install_hosts(monkeypatch, [], {})
     r = asyncio.run(S.jms_exec([], "uname -a"))
@@ -1310,6 +1553,51 @@ def test_preflight_world_size_matches_what_submit_would_launch(monkeypatch):
     pf = asyncio.run(S.jms_cluster_preflight(["a", "b"]))
     sub = asyncio.run(S.jms_cluster_submit(["a", "b"], "torchrun train.py"))
     assert pf["world_size_estimate"] == sub["world_size"] == 4
+
+
+# --- control plane: jms_create_ticket payload assembly ------------------------------
+
+
+def test_create_ticket_rejects_a_field_that_shadows_a_named_argument(monkeypatch):
+    """`fields` is spread beside the named args, so a collision cannot be built.
+
+    Left to Python it is a bare `TypeError` from inside the API call, which the SDK
+    shows the agent as the opaque "Error executing tool jms_create_ticket".
+    """
+    calls = []
+
+    class _FakeAPI:
+        async def create_ticket(self, **kwargs):
+            calls.append(kwargs)
+            return {"id": "t1"}
+
+    monkeypatch.setitem(S._state, "api", _FakeAPI())
+    r = asyncio.run(S.jms_create_ticket(title="t", fields={"title": "override"}))
+    assert r["ok"] is False
+    assert "may not repeat" in r["error"]
+    assert "title" in r["error"]
+    assert calls == []  # the malformed call never reached the API
+
+
+def test_create_ticket_spreads_the_type_specific_fields(monkeypatch):
+    calls = []
+
+    class _FakeAPI:
+        async def create_ticket(self, **kwargs):
+            calls.append(kwargs)
+            return {"id": "t1"}
+
+    monkeypatch.setitem(S._state, "api", _FakeAPI())
+    r = asyncio.run(
+        S.jms_create_ticket(
+            title="t",
+            ticket_type="login_asset_confirm",
+            fields={"apply_login_user": "u", "apply_login_account": "root"},
+        )
+    )
+    assert r["ok"] is True and r["ticket"] == {"id": "t1"}
+    assert calls[0]["apply_login_user"] == "u"
+    assert calls[0]["apply_login_account"] == "root"
 
 
 # --- shutdown: the lazily-built clients are closed, and forgotten -------------------

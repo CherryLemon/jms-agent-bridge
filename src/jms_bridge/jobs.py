@@ -131,16 +131,41 @@ def build_runner_script(
 
 
 def _collab_exports(
-    *, rank: int, nproc: int, world_size: int, master_addr: str, port: int
+    *,
+    rank: int,
+    node_rank: int,
+    nnodes: int,
+    nproc: int,
+    world_size: int,
+    master_addr: str,
+    port: int,
 ) -> str:
     """The ``export`` lines that wire one rank into a shared rendezvous.
 
-    Every rank gets the same ``JMS_WORLD_SIZE`` / ``JMS_MASTER_*`` and its own
-    ``JMS_RANK``; a distributed launcher on the host reads these to join the job.
+    Two different notions of "rank" are exported, because conflating them is what made
+    the documented ``torchrun`` recipe wrong:
+
+    * ``JMS_RANK`` is the **global device rank** of this node's first process (the sum of
+      the ``nproc`` of every node before it) and ``JMS_WORLD_SIZE`` is the total device
+      count. These describe the *process group*, for a launcher that sizes one itself.
+    * ``JMS_NODE_RANK`` / ``JMS_NNODES`` are the **node ordinal** and the node count —
+      what ``torchrun --node_rank`` / ``--nnodes`` actually take. On a 2-node, 2-chip
+      run the old exports said ``nnodes=4`` and the second node was ``node_rank=2``,
+      neither of which is a node.
+
+    Both are consistent: ``nnodes`` is the number of nodes handed to this call, and
+    ``node_rank`` = the index of this node in that list.
+
+    ``JMS_LOCAL_RANK`` stays ``0``: it is the in-node ordinal of the *bridge's* rank
+    process, and each rank node contributes one launcher. The per-device local ranks
+    belong to whatever ``torchrun``-style launcher the command starts, which sets them
+    itself.
     """
     env = {
         "JMS_RANK": str(rank),
         "JMS_LOCAL_RANK": "0",
+        "JMS_NODE_RANK": str(node_rank),
+        "JMS_NNODES": str(nnodes),
         "JMS_NPROC": str(nproc),
         "JMS_WORLD_SIZE": str(world_size),
         "JMS_MASTER_ADDR": master_addr,
@@ -276,12 +301,21 @@ class JobManager:
         pending = []
         job_id = _new_job_id()
         session = f"jms-{job_id}"
-        for host, nproc in assignments:
+        nnodes = len(assignments)
+        for node_rank, (host, nproc) in enumerate(assignments):
             root = _job_root(host, job_id)
 
             # Rank/world wiring, exported before the command; the launcher reads these.
+            # `rank` is the global *device* rank and `node_rank` the node ordinal — two
+            # different values, deliberately both exported (see `_collab_exports`).
             exports = _collab_exports(
-                rank=rank, nproc=nproc, world_size=world_size, master_addr=master_addr, port=port
+                rank=rank,
+                node_rank=node_rank,
+                nnodes=nnodes,
+                nproc=nproc,
+                world_size=world_size,
+                master_addr=master_addr,
+                port=port,
             )
             launch = _launch_script(
                 root, session, job_id, f"{exports}\n{command}", host.env_setup, host.workdir
@@ -372,12 +406,18 @@ class JobManager:
         # (the next poll re-reads a few bytes); the alternative loses them outright.
         consumed = max(0, min(int(max_bytes), size - int(offset)))
         return {
+            # Whether the *read* reached the host at all. An unreachable host yields an
+            # empty body that is indistinguishable from "no new output", so the caller
+            # needs this bit to avoid reporting a dead host as a clean, empty read.
+            "ok": res.ok,
             "host": host.name,
             "job_id": job_id,
             "offset": offset,
             "size": size,
             "next_offset": int(offset) + consumed,
             "log": body,
+            "exit_code": res.exit_code,
+            "error": res.stderr.strip()[:400] if not res.ok else "",
         }
 
     async def cancel(self, host: Host, job_id: str) -> dict:

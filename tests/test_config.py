@@ -31,6 +31,20 @@ def test_missing_url_raises(tmp_path, monkeypatch):
         load_config(tmp_path / "nonexistent.toml")
 
 
+def test_malformed_config_is_a_config_error_not_a_parser_error(tmp_path, monkeypatch):
+    """A typo in a hand-edited config must reach the agent as readable text.
+
+    The MCP tool wrapper only translates ``ConfigError``; the parser's own
+    ``TOMLDecodeError`` would surface as the opaque "Error executing tool <name>" for
+    every tool at once.
+    """
+    monkeypatch.delenv("JMS_BRIDGE_URL", raising=False)
+    p = tmp_path / "config.toml"
+    p.write_text('[bastion\nurl = "https://x"\n')  # missing ]
+    with pytest.raises(ConfigError, match="not valid TOML"):
+        load_config(p)
+
+
 def test_verify_tls_env_parsing(tmp_path, monkeypatch):
     p = tmp_path / "c.toml"
     p.write_text('[bastion]\nurl = "https://x"\n')

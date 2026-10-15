@@ -106,6 +106,22 @@ def test_missing_inventory_raises(tmp_path):
         Inventory.load(tmp_path / "nope.yaml")
 
 
+def test_malformed_inventory_is_an_inventory_error(tmp_path):
+    """A YAML typo must be an ``InventoryError`` so the tool wrapper can explain it."""
+    p = tmp_path / "hosts.yaml"
+    p.write_text("hosts:\n  a: [unclosed\n")
+    with pytest.raises(InventoryError, match="not valid YAML"):
+        Inventory.load(p)
+
+
+def test_inventory_that_is_not_a_mapping_is_rejected(tmp_path):
+    """`hosts:` as a list parses fine but has no `.get`; fail with a readable message."""
+    p = tmp_path / "hosts.yaml"
+    p.write_text("- one\n- two\n")
+    with pytest.raises(InventoryError, match="must be a mapping"):
+        Inventory.load(p)
+
+
 def test_platform_def_falls_back_to_generic():
     h = Host(name="x", platform="nonexistent")
     assert h.platform_def.name == "generic"
