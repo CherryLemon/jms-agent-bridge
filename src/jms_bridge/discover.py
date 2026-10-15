@@ -144,7 +144,6 @@ def build_discovery_script(
     (connect retries), and a shorter budget would turn an actionable "unreachable /
     unauthenticated" into an unhelpful "could not determine".
     """
-    """Build the host-side script that discovers one container's workspace facts."""
     inner = _INNER_TEMPLATE.format(
         match=shell_quote(repo_match),
         roots=" ".join(shell_quote(r) for r in (roots or DEFAULT_ROOTS)),

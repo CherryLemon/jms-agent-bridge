@@ -1,3 +1,4 @@
+import httpx
 import pytest
 
 from jms_bridge.api import JumpServerAPI, JumpServerError
@@ -97,8 +98,8 @@ def test_create_ticket_uses_open_action(monkeypatch):
     api = JumpServerAPI(BastionConfig(url="https://x", org_id="O1"))
     captured = {}
 
-    async def fake_request(method, path, *, params=None, json=None):
-        captured.update(method=method, path=path, json=json)
+    async def fake_request(method, path, *, params=None, json_body=None):
+        captured.update(method=method, path=path, json=json_body)
         return {"id": "T1"}
 
     monkeypatch.setattr(api, "request", fake_request)
@@ -117,3 +118,161 @@ def test_unknown_ticket_type_raises():
     api = JumpServerAPI(BastionConfig(url="https://x"))
     with pytest.raises(JumpServerError):
         asyncio.run(api.create_ticket(title="x", ticket_type="nope"))
+
+
+# --- transport failures are normalised to JumpServerError ---------------------------
+
+
+def test_transport_failure_is_a_jumpserver_error(monkeypatch):
+    """A DNS/refused/TLS failure must be a `JumpServerError`, not the raw httpx one.
+
+    The MCP tools (and `doctor`, and `login`) render `JumpServerError` as a message; the
+    underlying `httpx.ConnectError` would reach the agent as the opaque "Error executing
+    tool <name>", which is the first thing a mistyped bastion URL produces.
+    """
+    import asyncio
+
+    api = JumpServerAPI(BastionConfig(url="https://bastion.invalid", private_token="TOK"))
+
+    class _BoomClient:
+        async def request(self, *a, **k):
+            raise httpx.ConnectError("nodename nor servname provided")
+
+    async def fake_client():
+        return _BoomClient()
+
+    monkeypatch.setattr(api, "client", fake_client)
+    with pytest.raises(JumpServerError, match="ConnectError"):
+        asyncio.run(api.request("GET", "perms/users/my/assets/"))
+
+
+def test_ping_transport_failure_is_a_jumpserver_error(monkeypatch):
+    import asyncio
+
+    api = JumpServerAPI(BastionConfig(url="https://bastion.invalid", private_token="TOK"))
+
+    class _BoomClient:
+        async def get(self, *a, **k):
+            raise httpx.ConnectTimeout("timed out")
+
+    async def fake_client():
+        return _BoomClient()
+
+    monkeypatch.setattr(api, "client", fake_client)
+    with pytest.raises(JumpServerError, match="ConnectTimeout"):
+        asyncio.run(api.ping())
+
+
+def test_login_transport_failure_is_a_jumpserver_error(monkeypatch):
+    import asyncio
+
+    api = JumpServerAPI(BastionConfig(url="https://bastion.invalid"))
+
+    class _BoomClient:
+        async def post(self, *a, **k):
+            raise httpx.ConnectError("connection refused")
+
+    async def fake_client():
+        return _BoomClient()
+
+    monkeypatch.setattr(api, "client", fake_client)
+    with pytest.raises(JumpServerError, match="login failed"):
+        asyncio.run(api.login_with_password("u", "p"))
+
+
+def test_control_plane_tools_turn_a_transport_failure_into_a_readable_refusal(monkeypatch):
+    """The three REST tools must return `{ok: false, error: ...}`, never raise."""
+    import asyncio
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+    import jms_bridge.server as S
+
+    api = JumpServerAPI(BastionConfig(url="https://bastion.invalid", private_token="TOK"))
+
+    class _BoomClient:
+        async def request(self, *a, **k):
+            raise httpx.ConnectError("nodename nor servname provided")
+
+    async def fake_client():
+        return _BoomClient()
+
+    monkeypatch.setattr(api, "client", fake_client)
+    monkeypatch.setitem(S._state, "api", api)
+
+    for coro in (S.jms_list_assets(), S.jms_audit_query(), S.jms_create_ticket(title="t")):
+        r = asyncio.run(coro)
+        assert r["ok"] is False
+        assert "ConnectError" in r["error"]
+
+
+# --- asset listing must not silently truncate ---------------------------------------
+
+
+def test_list_assets_follows_pagination(monkeypatch):
+    """A second page must be fetched, not dropped.
+
+    The list used to stop at the first ``limit``-sized page, so a fleet larger than the
+    limit silently reported a partial inventory as though it were complete.
+    """
+    import asyncio
+
+    api = JumpServerAPI(BastionConfig(url="https://x", private_token="TOK"))
+    calls = []
+
+    async def fake_request(method, path, *, params=None, json_body=None):
+        calls.append(dict(params or {}))
+        offset = (params or {}).get("offset", 0)
+        if offset == 0:
+            return {
+                "count": 3,
+                "next": "https://x/page2",
+                "results": [{"id": "a"}, {"id": "b"}],
+            }
+        return {"count": 3, "next": None, "results": [{"id": "c"}]}
+
+    monkeypatch.setattr(api, "request", fake_request)
+    assets = asyncio.run(api.list_assets(limit=2))
+    assert [a["id"] for a in assets] == ["a", "b", "c"]
+    assert [c.get("offset", 0) for c in calls] == [0, 2]
+
+
+def test_list_assets_stops_on_a_bare_list(monkeypatch):
+    """A deployment without a pagination envelope still returns its (single) page."""
+    import asyncio
+
+    api = JumpServerAPI(BastionConfig(url="https://x", private_token="TOK"))
+    calls = []
+
+    async def fake_request(method, path, *, params=None, json_body=None):
+        calls.append(dict(params or {}))
+        return [{"id": "a"}, {"id": "b"}]
+
+    monkeypatch.setattr(api, "request", fake_request)
+    assets = asyncio.run(api.list_assets(limit=2))
+    assert [a["id"] for a in assets] == ["a", "b"]
+    assert len(calls) == 1  # no second request for a bare list
+
+
+def test_list_assets_bounds_the_walk(monkeypatch):
+    """A server that always claims another page must not loop forever."""
+    import asyncio
+
+    api = JumpServerAPI(BastionConfig(url="https://x", private_token="TOK"))
+    calls = []
+
+    async def fake_request(method, path, *, params=None, json_body=None):
+        calls.append(1)
+        return {"count": 9999, "next": "https://x/always", "results": [{"id": "x"}]}
+
+    monkeypatch.setattr(api, "request", fake_request)
+    asyncio.run(api.list_assets(limit=1, max_pages=3))
+    assert len(calls) == 3
+
+
+def test_api_does_not_export_the_json_module():
+    """`json` was in `__all__` only because a parameter shadowed the module."""
+    import jms_bridge.api as api
+
+    assert "json" not in api.__all__

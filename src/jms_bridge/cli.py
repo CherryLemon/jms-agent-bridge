@@ -24,7 +24,7 @@ from .api import JumpServerAPI, JumpServerError
 from .config import ConfigError, config_path, inventory_path, load_config
 from .inventory import Inventory, InventoryError
 from .platforms import PLATFORMS
-from .ssh import REACH_SENTINEL, SSHRunner
+from .ssh import REACH_PROBE, REACH_SENTINEL, SSHRunner, reached
 
 #: Printed by the ``doctor`` data-plane probe and required back in the reply — see
 #: :data:`jms_bridge.ssh.REACH_SENTINEL` for why the exit code alone cannot be trusted.
@@ -255,14 +255,14 @@ async def _verify_ssh_key(key: Path, targets: list[str]) -> int:
     ok = True
     try:
         for host in inv.resolve(targets):
-            res = await runner.exec_on(host, f"echo {_DOCTOR_SENTINEL} && hostname", timeout=45)
+            res = await runner.exec_on(host, f"{REACH_PROBE} && hostname", timeout=45)
             # Sentinel, not exit code: KoKo rejects a connection with exit 0 (see
-            # _DOCTOR_SENTINEL), so a status-only check would call a refused asset green.
-            reached = res.ok and _DOCTOR_SENTINEL in res.stdout
-            mark = "OK  " if reached else "FAIL"
+            # REACH_SENTINEL), so a status-only check would call a refused asset green.
+            is_up = reached(res)
+            mark = "OK  " if is_up else "FAIL"
             detail = res.stdout.strip() or res.stderr.strip()[:200]
             print(f"  {host.name:20} {mark} {detail}")
-            ok = ok and reached
+            ok = ok and is_up
     except (InventoryError, ConfigError) as exc:
         print(f"  verify failed: {exc}", file=sys.stderr)
         return 2
@@ -426,13 +426,13 @@ async def cmd_doctor(args: argparse.Namespace) -> int:
     try:
         hosts = inv.resolve(args.targets)
         for h in hosts:
-            res = await runner.exec_on(h, f"echo {_DOCTOR_SENTINEL} && hostname", timeout=45)
+            res = await runner.exec_on(h, f"{REACH_PROBE} && hostname", timeout=45)
             # Require the sentinel, not just a zero exit: a KoKo rejection exits 0 with
             # the error on stdout, and trusting that would report a dead asset green.
-            reached = res.ok and _DOCTOR_SENTINEL in res.stdout
-            mark = "OK  " if reached else "FAIL"
+            is_up = reached(res)
+            mark = "OK  " if is_up else "FAIL"
             print(f"  {h.name:20} {mark} {res.stdout.strip() or res.stderr.strip()[:200]}")
-            ok = ok and reached
+            ok = ok and is_up
     except Exception as exc:  # noqa: BLE001 - doctor reports, never raises
         print(f"  data plane   FAIL {exc}")
         ok = False
@@ -447,19 +447,30 @@ async def cmd_probe(args: argparse.Namespace) -> int:
     cfg = load_config()
     inv = Inventory.load()
     runner = SSHRunner(cfg, max_parallel=cfg.max_parallel)
+    ok = True
     try:
         for host in inv.resolve(args.targets):
             platform = host.platform_def
-            res = await runner.exec_on(host, platform.probe_cmd, timeout=45, workdir=False)
+            # The sentinel rides the probe's own round trip: a KoKo rejection exits 0 with
+            # its error on stdout, so without this a refused asset prints a bogus empty
+            # probe (and no accelerator) as though it were a healthy host.
+            cmd = f"{REACH_PROBE} && {{ {platform.probe_cmd}; }}"
+            res = await runner.exec_on(host, cmd, timeout=45, workdir=False)
+            served = reached(res)
+            body = res.stdout.replace(f"{REACH_SENTINEL}\n", "", 1)
             print(f"### {host.name} [{platform.name}]  exit={res.exit_code}")
-            if res.ok:
-                for k, v in platform.parse_probe(res.stdout).items():
+            if not served:
+                print(f"    UNREACHABLE: {(res.stdout or res.stderr).strip()[:400]}")
+                ok = False
+            elif res.ok:
+                for k, v in platform.parse_probe(body).items():
                     print(f"    {k}: {v}")
             else:
                 print(f"    {res.stderr.strip()[:400]}")
+                ok = False
     finally:
         await runner.close()
-    return 0
+    return 0 if ok else 1
 
 
 def main(argv: list[str] | None = None) -> int:

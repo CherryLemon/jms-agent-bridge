@@ -363,7 +363,7 @@ otherwise the bridge starts up holding a token the server may no longer accept.
 | `jms_list_assets` | REST | Assets this account can reach (id, name, address, platform) — for building the inventory |
 | `jms_audit_query` | REST | Recent command records — "what did the agent run?" |
 | `jms_create_ticket` | REST | Raise an approval ticket when policy gates an action |
-| `jms_probe` | SSH | Liveness + accelerator + version across a host set |
+| `jms_probe` | SSH | Liveness + accelerator + version across a host set (a KoKo rejection is reported as unreachable, not as a healthy host) |
 | `jms_fleet_summary` | SSH | Roll the fleet up: reachable hosts and accelerators present, per platform |
 | `jms_exec` | SSH | Short command on one or many hosts, in parallel |
 | `jms_sync_push` / `jms_sync_pull` | rsync | Move code and artifacts across hosts |

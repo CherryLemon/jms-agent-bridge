@@ -179,3 +179,93 @@ def test_max_parallel_below_one_cannot_deadlock_the_semaphore():
     cfg = BastionConfig(url="https://bastion.example.com")
     assert SSHRunner(cfg, max_parallel=0).max_parallel == 1
     assert SSHRunner(cfg, max_parallel=-4).max_parallel == 1
+
+
+# --- a cancelled or timed-out call must reap its child process ----------------------
+
+
+class _ChildTracker:
+    """Stands in for the runner's subprocess spawn, handing back a real long-lived child.
+
+    A subprocess is what actually leaks, so the test uses a real one: the tracked process
+    is a ``sleep`` and the assertion is that none survives the call. ``_real_exec`` is
+    captured before patching, so the tracker's own spawn does not recurse into the patch.
+    """
+
+    def __init__(self):
+        self.procs: list[asyncio.subprocess.Process] = []
+
+    async def spawn(self, real_exec):
+        proc = await real_exec(
+            "sleep", "300",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        self.procs.append(proc)
+        return proc
+
+
+_REAL_EXEC = asyncio.create_subprocess_exec
+
+
+def _patch_spawn(monkeypatch, tracker):
+    """Make the runner's spawn return a tracked real child."""
+
+    async def fake_exec(*argv, **kw):
+        return await tracker.spawn(_REAL_EXEC)
+
+    monkeypatch.setattr("jms_bridge.ssh.asyncio.create_subprocess_exec", fake_exec)
+    monkeypatch.setattr("jms_bridge.ssh.shutil.which", lambda name, *a, **k: "/usr/bin/" + name)
+
+
+def test_cancelling_a_command_kills_the_child_process(monkeypatch):
+    """A cancelled tool call must not leave ssh running.
+
+    ``asyncio.CancelledError`` is a ``BaseException``; catching only ``TimeoutError`` (as
+    the runner used to) skips the kill entirely, so every cancelled call — a client
+    disconnect, a long response cut off by the gateway — leaked one ssh process holding
+    the ControlMaster socket.
+    """
+    r = make_runner()
+    tracker = _ChildTracker()
+    _patch_spawn(monkeypatch, tracker)
+
+    h = Host(name="a", login="u", asset_id="A")
+
+    async def main():
+        task = asyncio.create_task(r._run_script(h, "echo hi", 600))
+        await asyncio.sleep(0.2)  # let the child start
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(main())
+    assert tracker.procs, "no child was spawned"
+    for proc in tracker.procs:
+        assert proc.returncode is not None, "cancelling leaked the child process"
+
+
+def test_a_timed_out_command_kills_the_child_process(monkeypatch):
+    """The timeout path must still kill (and now also reap) the child."""
+    r = make_runner()
+    tracker = _ChildTracker()
+    _patch_spawn(monkeypatch, tracker)
+
+    h = Host(name="a", login="u", asset_id="A")
+    res = asyncio.run(r._run_script(h, "echo hi", 0.2))
+    assert res.timed_out is True and res.exit_code == 124
+    assert tracker.procs and all(p.returncode is not None for p in tracker.procs)
+
+
+def test_kill_helper_ignores_an_already_dead_process():
+    """`_kill` must be safe on a process that already exited (race between check/kill)."""
+    from jms_bridge.ssh import _kill
+
+    async def main():
+        proc = await asyncio.create_subprocess_exec(
+            "true", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        await proc.wait()
+        await _kill(proc)  # must not raise ProcessLookupError
+
+    asyncio.run(main())

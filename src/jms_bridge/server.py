@@ -40,7 +40,7 @@ from .config import BastionConfig, ConfigError, load_config
 from .discover import DEFAULT_REPO_MATCH
 from .inventory import Host, Inventory, InventoryError, shell_quote
 from .jobs import JobManager, validate_job_id
-from .ssh import REACH_SENTINEL, ExecResult, SSHRunner
+from .ssh import REACH_PROBE, REACH_SENTINEL, ExecResult, SSHRunner, reached
 from .workspace import CONTAINER_RE, DEFAULT_CONTAINER, SOURCES
 
 log = logging.getLogger("jms_bridge.server")
@@ -394,6 +394,12 @@ async def jms_probe(targets: list[str]) -> dict:
     ``targets`` are inventory selectors: host names, group names, or tags. Runs the
     platform-appropriate command (``npu-smi`` / ``nvidia-smi`` / ``uname``) on every
     host in parallel and parses the result.
+
+    `ok` means the host was actually *reached*, which is stricter than "the ssh command
+    exited 0": KoKo rejects a connection (no permission, asset offline, bad address) with
+    exit 0 and the error on stdout, so a status-only check reports a dead asset green.
+    The probe command is prefixed with the ``jms-bridge-ok`` sentinel and the reply must
+    carry it back.
     """
     hosts = _resolve(targets)
     if not hosts:
@@ -405,8 +411,11 @@ async def jms_probe(targets: list[str]) -> dict:
     # one round trip per host.
     async def one(host: Host) -> dict:
         platform = host.platform_def
+        # The sentinel rides the same round trip as the probe: whatever the platform
+        # command prints, a reply without the sentinel means the far side never ran it.
+        cmd = f"{REACH_PROBE} && {{ {platform.probe_cmd}; }}"
         try:
-            res = await _ssh().exec_on(host, platform.probe_cmd, timeout=45, workdir=False)
+            res = await _ssh().exec_on(host, cmd, timeout=45, workdir=False)
         except Exception as exc:  # noqa: BLE001 - isolating one host is the point
             return {
                 "host": host.name,
@@ -415,14 +424,24 @@ async def jms_probe(targets: list[str]) -> dict:
                 "exit_code": None,
                 "stderr": f"{type(exc).__name__}: {exc}"[:400],
             }
-        parsed = platform.parse_probe(res.stdout) if res.ok else {}
+        served = reached(res)
+        # Strip the sentinel line so `raw` (and any parser fed by it) sees only the
+        # platform command's own output.
+        body = res.stdout.replace(f"{REACH_SENTINEL}\n", "", 1)
+        parsed = platform.parse_probe(body) if served else {}
+        # A reached host whose platform command *failed* is still a failure to probe;
+        # report the difference rather than collapsing both into one flag.
+        detail = res.stderr.strip()[:400] if not res.ok else ""
+        if served and not res.ok:
+            detail = detail or "probe command failed on the host"
         return {
             "host": host.name,
             "platform": platform.name,
-            "ok": res.ok,
+            "ok": served and res.ok,
+            "reached": served,
             "exit_code": res.exit_code,
             **parsed,
-            "stderr": res.stderr.strip()[:400] if not res.ok else "",
+            "stderr": detail,
         }
 
     results = list(await asyncio.gather(*(one(h) for h in hosts)))
@@ -482,19 +501,19 @@ async def jms_fleet_summary(targets: list[str], probe: bool = True) -> dict:
     async def one(host: Host) -> dict:
         platform = host.platform_def
         try:
-            res = await ssh.exec_on(host, f"echo {REACH_SENTINEL} && hostname", timeout=45)
-            reached = res.ok and REACH_SENTINEL in res.stdout
-            reason = "" if reached else (res.stdout or res.stderr or "").strip()[:200]
+            res = await ssh.exec_on(host, f"{REACH_PROBE} && hostname", timeout=45)
+            is_up = reached(res)
+            reason = "" if is_up else (res.stdout or res.stderr or "").strip()[:200]
         except Exception as exc:  # noqa: BLE001 - a transport failure is just unreachable
-            reached, reason = False, f"{type(exc).__name__}: {exc}"[:200]
+            is_up, reason = False, f"{type(exc).__name__}: {exc}"[:200]
         count = None
-        if reached and probe:
+        if is_up and probe:
             pr = await ssh.exec_on(host, platform.probe_cmd, timeout=45, workdir=False)
             count = platform.parse_probe(pr.stdout).get("device_count")
         return {
             "host": host.name,
             "platform": platform.name,
-            "reachable": reached,
+            "reachable": is_up,
             "device_count": count,
             "reason": reason,
         }

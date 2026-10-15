@@ -5,7 +5,7 @@ from jms_bridge import __version__
 from jms_bridge.inventory import Host, Inventory
 from jms_bridge.jobs import TERMINAL_STATUS, JobHandle
 from jms_bridge.server import _looks_dangerous
-from jms_bridge.ssh import ExecResult
+from jms_bridge.ssh import REACH_SENTINEL, ExecResult
 from jms_bridge.workspace import Workspace
 
 
@@ -1332,7 +1332,9 @@ def test_probe_fans_out_concurrently(monkeypatch):
             self.max_in_flight = max(self.max_in_flight, self.in_flight)
             await asyncio.sleep(0.02)
             self.in_flight -= 1
-            return ExecResult(host.name, 0, "GPU 0\n", "")
+            # The sentinel proves the far side ran the command; a fake reply must carry
+            # it too, or the probe (correctly) reports the host unreached.
+            return ExecResult(host.name, 0, f"{REACH_SENTINEL}\nGPU 0\n", "")
 
     inv = Inventory(hosts={h.name: h for h in hosts}, groups={}, workspaces={})
     fake = _SlowSSH()
@@ -1343,6 +1345,53 @@ def test_probe_fans_out_concurrently(monkeypatch):
     assert fake.max_in_flight > 1, "probes were issued sequentially"
 
 
+def test_probe_rejects_a_koko_refusal_that_exits_zero(monkeypatch):
+    """A KoKo rejection exits 0 with its error on stdout — it is not a healthy probe.
+
+    This is the same trap `jms_fleet_summary` and `doctor` guard against with the
+    sentinel; `jms_probe` used to trust the exit code alone and report a refused asset
+    as a reachable host with no accelerator.
+    """
+
+    hosts = [Host(name=n, login="u", asset_id="A", platform="cuda") for n in ("a", "b")]
+
+    class _RefusingSSH(_FakeSSH):
+        async def exec_on(self, host, command, *, timeout=60.0, workdir=True, env_setup=True):
+            if host.name == "b":
+                # KoKo's actual shape: exit 0, rejection text on stdout, no sentinel.
+                return ExecResult(host.name, 0, "koko: no permission to access the asset\n", "")
+            return ExecResult(host.name, 0, f"{REACH_SENTINEL}\nGPU 0\n", "")
+
+    inv = Inventory(hosts={h.name: h for h in hosts}, groups={}, workspaces={})
+    monkeypatch.setitem(S._state, "inv", inv)
+    monkeypatch.setitem(S._state, "ssh", _RefusingSSH({}))
+    r = asyncio.run(S.jms_probe(["all"]))
+    by_host = {h["host"]: h for h in r["hosts"]}
+    assert r["ok"] is False
+    assert by_host["b"]["ok"] is False and by_host["b"]["reached"] is False
+    assert by_host["b"]["exit_code"] == 0  # the exit code alone lied
+    assert by_host["a"]["ok"] is True and by_host["a"]["reached"] is True
+
+
+def test_probe_strips_the_sentinel_from_the_parsed_output(monkeypatch):
+    """`raw` must show the platform command's output, not the reachability preamble."""
+
+    class _SSH(_FakeSSH):
+        async def exec_on(self, host, command, *, timeout=60.0, workdir=True, env_setup=True):
+            return ExecResult(host.name, 0, f"{REACH_SENTINEL}\nCUDA Version: 12.4\n", "")
+
+    inv = Inventory(
+        hosts={"a": Host(name="a", login="u", asset_id="A", platform="cuda")},
+        groups={},
+        workspaces={},
+    )
+    monkeypatch.setitem(S._state, "inv", inv)
+    monkeypatch.setitem(S._state, "ssh", _SSH({}))
+    r = asyncio.run(S.jms_probe(["all"]))
+    assert r["hosts"][0]["raw"].strip() == "CUDA Version: 12.4"
+    assert r["hosts"][0]["version"] == "12.4"
+
+
 def test_probe_isolates_a_host_that_raises(monkeypatch):
     """One host's transport error must not erase the other hosts' probe results."""
     hosts = [Host(name=n, login="u", asset_id="A") for n in ("a", "b")]
@@ -1351,7 +1400,7 @@ def test_probe_isolates_a_host_that_raises(monkeypatch):
         async def exec_on(self, host, command, *, timeout=60.0, workdir=True, env_setup=True):
             if host.name == "b":
                 raise RuntimeError("ssh binary vanished")
-            return ExecResult(host.name, 0, "GPU 0\n", "")
+            return ExecResult(host.name, 0, f"{REACH_SENTINEL}\nGPU 0\n", "")
 
     inv = Inventory(hosts={h.name: h for h in hosts}, groups={}, workspaces={})
     monkeypatch.setitem(S._state, "inv", inv)

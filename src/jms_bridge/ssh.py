@@ -35,6 +35,10 @@ from .inventory import Host, InventoryError, wrap_command
 #: far side — it is what makes a reachability check trustworthy.
 REACH_SENTINEL = "jms-bridge-ok"
 
+#: Prefix a command so its reply is provably from the far side: if the command runs at
+#: all, the sentinel comes back ahead of its output. Use with :func:`reached`.
+REACH_PROBE = f"echo {REACH_SENTINEL}"
+
 
 def _require_tool(binary: str, hint: str) -> None:
     """Fail with an actionable ``ConfigError`` when a local tool is missing.
@@ -46,6 +50,29 @@ def _require_tool(binary: str, hint: str) -> None:
     """
     if shutil.which(binary) is None:
         raise ConfigError(f"`{binary}` is not installed — {hint}")
+
+
+async def _kill(proc: asyncio.subprocess.Process) -> None:
+    """Terminate a spawned ssh/rsync and reap it, whatever ended the wait.
+
+    Called under ``except BaseException`` — which includes ``asyncio.CancelledError`` — so
+    a cancelled tool call (the client disconnecting, the gateway cutting a long response
+    off) does not leave the child running. Catching only ``TimeoutError`` leaked one ssh
+    process per cancelled call: ``CancelledError`` is a ``BaseException``, so it skipped
+    the kill entirely. The process would go on holding the ControlMaster socket and,
+    for a job launch, the remote work it was asked to start. ``wait()`` is itself
+    shielded from a second cancellation by re-raising only after the child is reaped.
+    """
+    if proc.returncode is not None:
+        return
+    try:
+        proc.kill()
+    except ProcessLookupError:  # already gone between the check and the kill
+        return
+    try:
+        await proc.wait()
+    except asyncio.CancelledError:  # pragma: no cover - second cancel during reaping
+        pass
 
 
 #: ssh options shared by every invocation.
@@ -85,6 +112,18 @@ class ExecResult:
             "stdout": self.stdout,
             "stderr": self.stderr,
         }
+
+
+def reached(res: ExecResult) -> bool:
+    """Whether ``res`` proves the command actually ran on the far side.
+
+    An exit code of 0 is *not* that proof: KoKo rejects a connection (no permission, asset
+    offline, bad address) with exit 0 and its error on stdout, so a status-only check
+    reports a dead asset green. Only a reply carrying :data:`REACH_SENTINEL` — which the
+    command echoed via :data:`REACH_PROBE` — does. Every reachability decision in the
+    codebase goes through here, so the rule cannot drift apart between tools.
+    """
+    return res.ok and REACH_SENTINEL in res.stdout
 
 
 class SSHRunner:
@@ -204,8 +243,7 @@ class SSHRunner:
                     stderr=err.decode(errors="replace"),
                 )
             except (TimeoutError, asyncio.TimeoutError):
-                proc.kill()
-                await proc.wait()
+                await _kill(proc)
                 return ExecResult(
                     host=host.name,
                     exit_code=124,
@@ -213,6 +251,12 @@ class SSHRunner:
                     stderr=f"timed out after {timeout}s",
                     timed_out=True,
                 )
+            except BaseException:
+                # Cancellation (or anything else) must still reap the child — otherwise a
+                # cancelled call leaves the ssh process running. Re-raised so the caller
+                # sees the original failure, not a masked one.
+                await _kill(proc)
+                raise
 
     async def exec_on(
         self,
@@ -306,9 +350,17 @@ class SSHRunner:
             try:
                 out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
             except (TimeoutError, asyncio.TimeoutError):
-                proc.kill()
-                await proc.wait()
+                await _kill(proc)
                 return ExecResult(host.name, 124, "", f"rsync timed out after {timeout}s", True)
+            except BaseException:
+                # A cancelled transfer must not leave rsync running — a multi-gigabyte
+                # checkpoint pull would otherwise keep going unseen. Note this kills
+                # rsync itself, not the ssh child rsync spawned for the transfer: that
+                # child is a *slave* connection, so it exits on its own once rsync's
+                # pipes close (unlike `_run_script`, where ssh is the long-lived master
+                # the kill has to reach).
+                await _kill(proc)
+                raise
             return ExecResult(
                 host.name,
                 proc.returncode or 0,

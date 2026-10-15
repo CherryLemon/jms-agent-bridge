@@ -60,7 +60,14 @@ SIGNED_HEADERS = ["(request-target)", "date", "accept"]
 
 
 class JumpServerError(RuntimeError):
-    """Raised on a non-2xx response or an unusable API response."""
+    """Raised on a non-2xx response or an unusable API response.
+
+    A transport failure (DNS, refused connection, TLS, timeout) is raised as this too,
+    not as the underlying ``httpx`` exception. Every caller — the MCP tools, ``doctor``,
+    ``login`` — already has a readable path for ``JumpServerError``; letting ``httpx``'s
+    own exception through meant a mistyped bastion URL reached the agent as the opaque
+    "Error executing tool <name>", which is precisely the first thing a new user hits.
+    """
 
 
 @dataclass
@@ -152,7 +159,12 @@ class JumpServerAPI:
         )
 
     async def request(
-        self, method: str, path: str, *, params: dict | None = None, json: dict | None = None
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict | None = None,
+        json_body: dict | None = None,
     ) -> dict:
         url = self.cfg.api_url(path)
         # The signature binds the *request target* exactly as it goes on the wire:
@@ -166,13 +178,20 @@ class JumpServerAPI:
 
         headers = self._auth_headers(method, signed_path)
         body = None
-        if json is not None:
-            body = __import__("json").dumps(json).encode()
+        if json_body is not None:
+            body = json.dumps(json_body).encode()
             headers["Content-Type"] = "application/json"
         client = await self.client()
-        resp = await client.request(
-            method, url, params=params, content=body, headers=headers
-        )
+        try:
+            resp = await client.request(
+                method, url, params=params, content=body, headers=headers
+            )
+        except httpx.HTTPError as exc:
+            # Normalise every transport failure into the one error type the callers
+            # already render. `httpx` raises a family of exceptions (ConnectError,
+            # ConnectTimeout, ReadTimeout, TLS failures) and each would otherwise reach
+            # the agent as an opaque tool error.
+            raise JumpServerError(f"{method} {path} -> {type(exc).__name__}: {exc}") from exc
         if not resp.is_success:
             raise JumpServerError(f"{method} {path} -> {resp.status_code}: {resp.text[:500]}")
         if not resp.content:
@@ -185,10 +204,13 @@ class JumpServerAPI:
     async def login_with_password(self, username: str, password: str) -> str:
         """Session login; stores a bearer token for subsequent calls."""
         client = await self.client()
-        resp = await client.post(
-            self.cfg.api_url("authentication/auth/"),
-            json={"username": username, "password": password},
-        )
+        try:
+            resp = await client.post(
+                self.cfg.api_url("authentication/auth/"),
+                json={"username": username, "password": password},
+            )
+        except httpx.HTTPError as exc:
+            raise JumpServerError(f"login failed: {type(exc).__name__}: {exc}") from exc
         if not resp.is_success:
             raise JumpServerError(f"login failed: {resp.status_code} {resp.text[:300]}")
         data = resp.json()
@@ -201,8 +223,11 @@ class JumpServerAPI:
     async def ping(self) -> dict:
         """Unauthenticated health check (works before credentials are configured)."""
         client = await self.client()
-        resp = await client.get(f"{self.cfg.url.rstrip('/')}/api/health/")
-        resp.raise_for_status()
+        try:
+            resp = await client.get(f"{self.cfg.url.rstrip('/')}/api/health/")
+            resp.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise JumpServerError(f"health check failed: {type(exc).__name__}: {exc}") from exc
         return resp.json()
 
     async def version(self) -> str | None:
@@ -216,13 +241,35 @@ class JumpServerAPI:
 
     # --- discovery -------------------------------------------------------------
 
-    async def list_assets(self, *, search: str | None = None, limit: int = 200) -> list[dict]:
-        """Assets the current account is permitted to reach (the perm-scoped list)."""
-        params: dict = {"limit": limit}
-        if search:
-            params["q"] = search
-        data = await self.request("GET", "perms/users/my/assets/", params=params)
-        return data.get("results", data if isinstance(data, list) else [])
+    async def list_assets(
+        self, *, search: str | None = None, limit: int = 200, max_pages: int = 10
+    ) -> list[dict]:
+        """Assets the current account is permitted to reach (the perm-scoped list).
+
+        Follows DRF pagination: a deployment with more than ``limit`` permitted assets
+        returns one page and a ``next`` link, and stopping at the first page silently
+        truncated the list — a fleet of 250 would show 200 with nothing to say so.
+        ``max_pages`` bounds the walk so a misreported ``next`` cannot loop forever.
+        """
+        out: list[dict] = []
+        offset = 0
+        for _ in range(max(1, max_pages)):
+            params: dict = {"limit": limit, "offset": offset}
+            if search:
+                params["q"] = search
+            data = await self.request("GET", "perms/users/my/assets/", params=params)
+            # A bare list (no pagination envelope) is the older DRF shape; handle it
+            # before the dict branch, since `.get` on a list would raise.
+            if isinstance(data, list):
+                out.extend(data)
+                break
+            page = data.get("results", [])
+            out.extend(page)
+            # No `next` (or a short/empty page) ends the walk.
+            if not data.get("next") or len(page) < limit:
+                break
+            offset += limit
+        return out
 
     async def get_asset(self, asset_id: str) -> dict:
         """One permitted asset, including its ``permed_accounts`` and protocols.
@@ -302,7 +349,7 @@ class JumpServerAPI:
             "comment": comment,
             **fields,
         }
-        return await self.request("POST", f"tickets/{collection}/open/", json=payload)
+        return await self.request("POST", f"tickets/{collection}/open/", json_body=payload)
 
     async def list_tickets(self, *, state: str | None = None, limit: int = 50) -> list[dict]:
         params: dict = {"limit": limit, "order": "-date_created"}
@@ -312,4 +359,4 @@ class JumpServerAPI:
         return data.get("results", [])
 
 
-__all__ = ["JumpServerAPI", "JumpServerError", "SIGNED_HEADERS", "json"]
+__all__ = ["JumpServerAPI", "JumpServerError", "SIGNED_HEADERS"]

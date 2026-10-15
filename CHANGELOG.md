@@ -46,6 +46,30 @@
 
 ### Fixed
 
+- **`jms_probe` (and `jms-bridge probe`) reported a KoKo-rejected asset as a healthy,
+  accelerator-less host.** KoKo refuses a connection (no permission, asset offline, bad
+  address) with ssh **exit 0** and the error on stdout, so a status-only check is green on
+  a dead asset. `jms_fleet_summary` and `doctor` already guarded with the `jms-bridge-ok`
+  sentinel; `jms_probe` did not. The sentinel rule now lives in one place
+  (`ssh.reached` / `ssh.REACH_PROBE`), every reachability decision calls it, and the probe
+  report separates "never reached" from "the platform command failed on the host".
+  `jms-bridge probe` also now exits nonzero when a host is unreachable — it always
+  returned 0 before.
+- **A cancelled or timed-out command leaked its ssh/rsync process.** `_run_script` and
+  `rsync` caught only `TimeoutError`, and `asyncio.CancelledError` is a `BaseException`, so
+  a cancelled call (a client disconnecting, a long response the gateway cuts off) skipped
+  the kill entirely and left the child holding the ControlMaster socket. Both now kill and
+  reap under `except BaseException`, through one `ssh._kill` helper, and re-raise.
+- **Every control-plane call turned a transport failure into an opaque tool error.**
+  `jms_list_assets`, `jms_audit_query` and `jms_create_ticket` caught `JumpServerError`,
+  but `httpx` raises its own family (ConnectError, ConnectTimeout, TLS failures) for a
+  mistyped URL, DNS failure or timeout — the *first* thing a new user hits. `api.request`,
+  `login_with_password` and `ping` now normalise those into `JumpServerError`, which every
+  caller already renders as a message.
+- **`jms_list_assets` silently truncated at 200 assets.** The first page was returned as
+  though it were the whole fleet; a deployment with 250 permitted assets showed 200 with
+  nothing to say so. `list_assets` now follows DRF `next`/`offset` pagination (bounded, so
+  a misreported `next` cannot loop forever) and still handles the older bare-list shape.
 - **`jms_job_logs` reported `ok: true` on a host it never read.** An unreachable host
   returns an empty body, indistinguishable from a job that has not logged yet, so the tool
   hard-coded a green that was really "we learned nothing". `JobManager.logs` now reports
@@ -91,6 +115,12 @@
   real surface was the set of `@_tool()` decorators, so adding a tool silently left the
   doc wrong. A test now derives the count from the server's registry and compares it, and
   the claim is verified to fail when the two drift.
+- **`api.request`'s `json` parameter shadowed the `json` module.** The workaround was an
+  inline `__import__("json")`, and the shadowed module had leaked into `__all__` as though
+  it were public API (nothing imported it that way). The parameter is now `json_body` and
+  the export is dropped.
+- **`discover.build_discovery_script` carried two adjacent docstrings.** The second was
+  dead — a no-op expression statement — and the first was the real one; the stray is gone.
 
 ## 0.2.2 — 2026-10-14
 
