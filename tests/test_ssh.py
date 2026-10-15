@@ -198,6 +198,11 @@ class _ChildTracker:
     async def spawn(self, real_exec):
         proc = await real_exec(
             "sleep", "300",
+            # `stdin=PIPE` matters: `_run_script` calls `communicate(script)`, and on
+            # Python 3.10/3.11 that raises AttributeError when stdin is None (3.12+
+            # tolerates it). The fake must mirror the real spawn's shape, or the test
+            # only passes on the newer interpreter.
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
