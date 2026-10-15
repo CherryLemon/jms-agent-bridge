@@ -38,7 +38,7 @@ def test_mcp_server_lists_all_tools():
     from mcp.client.stdio import stdio_client
 
     expected = {
-        "jms_list_assets", "jms_audit_query", "jms_create_ticket",
+        "jms_list_assets", "jms_asset_detail", "jms_audit_query", "jms_create_ticket",
         "jms_probe", "jms_exec", "jms_sync_push", "jms_sync_pull",
         "jms_pull_artifacts", "jms_fleet_summary",
         "jms_submit_job", "jms_job_status", "jms_job_logs", "jms_job_cancel",
@@ -76,6 +76,7 @@ def test_mcp_server_lists_all_tools():
 #: would let it run unattended.
 _READ_ONLY_TOOLS = {
     "jms_list_assets",
+    "jms_asset_detail",
     "jms_audit_query",
     "jms_probe",
     "jms_fleet_summary",
@@ -121,11 +122,14 @@ def test_every_tool_declares_annotations_and_the_read_only_set_is_exact():
 #: field the schema omits disappears from the structured content a client consumes.
 _STRUCTURED_TOOLS = {
     "jms_job_status": {"ok", "status", "error"},
-    "jms_job_logs": {"ok", "host", "job_id", "offset", "size", "next_offset", "log", "error"},
     "jms_cluster_preflight": {"ok", "world_size_estimate", "rendezvous", "hosts", "error"},
     "jms_cluster_submit": {"ok", "rendezvous", "world_size", "nnodes", "job_id", "ranks", "error"},
     "jms_dev_run": {"ok", "rows", "columns", "revisions_consistent", "error"},
 }
+
+#: Tools whose payload is a large text blob. A structured result is sent *alongside* the
+#: text block, so a schema here would double the reply for no field-discoverability gain.
+_UNSTRUCTURED_BY_DESIGN = {"jms_job_logs"}
 
 
 def test_structured_tools_publish_the_fields_they_return():
@@ -139,7 +143,72 @@ def test_structured_tools_publish_the_fields_they_return():
         assert not missing, f"{name} schema omits {sorted(missing)}"
 
 
-def test_structured_and_unstructured_tools_both_still_work(monkeypatch):
+def test_blob_tools_are_unstructured_so_the_payload_is_not_sent_twice():
+    """A text-blob tool must not carry an `outputSchema`.
+
+    The SDK sends a structured result *in addition to* the text block, so a schema on
+    `jms_job_logs` duplicated a 100 KB log on the wire (measured). The fields are already
+    in the text; the schema bought nothing and cost a doubling.
+    """
+    tools = {t.name: t for t in asyncio.run(S.server.list_tools())}
+    for name in _UNSTRUCTURED_BY_DESIGN:
+        assert tools[name].output_schema is None, (
+            f"{name} regrew an output schema; its payload would be sent twice"
+        )
+
+
+def test_the_context_parameter_is_not_advertised_as_an_argument():
+    """`ctx` is injected by the SDK and must not appear in a tool's input schema.
+
+    If it leaked, a client would see an `ctx` argument it cannot supply and might pass
+    junk for it. The tools that take progress take it as `ctx: Context | None`.
+    """
+    tools = {t.name: t for t in asyncio.run(S.server.list_tools())}
+    for name in ("jms_dev_run", "jms_dev_discover"):
+        props = tools[name].input_schema.get("properties", {})
+        assert "ctx" not in props, f"{name} advertises its context parameter"
+        assert "context" not in props
+
+
+def test_progress_is_best_effort_and_never_breaks_a_tool(monkeypatch):
+    """A failing progress channel must not fail the work.
+
+    `Context.report_progress` raises outside a live request (a direct call from a test or
+    an embedder), and a client that ignores progress is not an error either. Both are
+    swallowed.
+    """
+    import asyncio as _asyncio
+
+    from jms_bridge.server import _progress
+
+    class _Exploding:
+        async def report_progress(self, *a, **k):
+            raise ValueError("Context is not available outside of a request")
+
+    _asyncio.run(_progress(_Exploding(), 1, 2, "half"))  # must not raise
+    _asyncio.run(_progress(None, 1, 2, "half"))          # no context at all
+
+
+def test_dev_run_reports_progress_per_chip(monkeypatch):
+    """A fleet-wide run must emit progress, so a spinner is distinguishable from a hang."""
+    progress: list[tuple] = []
+
+    class _Ctx:
+        async def report_progress(self, done, total, message=None):
+            progress.append((done, total, message))
+
+    _install(monkeypatch, [_ws("a", "h1"), _ws("b", "h2")], {
+        "git fetch": (0, "abc1234\n", ""),
+        "pytest": (0, "PASSED tests/t.py::test_x\n1 passed\n", ""),
+    })
+    asyncio.run(S.jms_dev_run(["all"], "main", ctx=_Ctx()))
+    assert progress, "jms_dev_run emitted no progress"
+    assert all(total == 2 for _, total, _ in progress)
+    assert sorted(done for done, _, _ in progress) == [1, 2]
+    assert any("2/2" in (msg or "") for _, _, msg in progress)
+
+
+def test_structured_tools_and_unstructured_tools_both_still_work(monkeypatch):
     """A schema must not change the payload a caller receives.
 
     The SDK validates structured output against the schema and strips unknown keys from
@@ -1219,6 +1288,26 @@ def test_job_wait_reports_finished_once_every_host_is_terminal(monkeypatch):
     assert jobs.calls == [("wait", [("a", "abcd1234"), ("b", "abcd1234")], 5)]
 
 
+#: The tightest client tool-call cap we support (dsh's default). A bounded wait whose own
+#: default exceeded this would be killed by the client before it could return its partial
+#: answer, so the user sees a transport error instead of `finished: false`.
+_TIGHTEST_CLIENT_CAP_SECONDS = 60.0
+
+
+def test_job_wait_default_timeout_fits_inside_the_tightest_client_cap():
+    """`jms_job_wait`'s default must let the *tool* return, not the client time out.
+
+    This is the invariant that keeps the bounded-wait contract meaningful on every client.
+    The schema is what a client sees, so assert on the published default.
+    """
+    tools = {t.name: t for t in asyncio.run(S.server.list_tools())}
+    default = tools["jms_job_wait"].input_schema["properties"]["timeout"]["default"]
+    assert default < _TIGHTEST_CLIENT_CAP_SECONDS, (
+        f"jms_job_wait defaults to {default}s, at or above the {_TIGHTEST_CLIENT_CAP_SECONDS}s "
+        "client cap; the client would kill the call before the tool could return"
+    )
+
+
 def test_job_wait_timeout_is_not_a_failure(monkeypatch):
     # A bounded wait that runs out must say so, not error: the job is still running, and
     # the caller is free to wait again or cancel.
@@ -1392,6 +1481,60 @@ def test_probe_strips_the_sentinel_from_the_parsed_output(monkeypatch):
     assert r["hosts"][0]["version"] == "12.4"
 
 
+def test_probe_reports_why_a_host_was_not_reached(monkeypatch):
+    """A rejection's explanation must survive into the reply.
+
+    KoKo puts the reason on **stdout** and exits 0, so extracting a detail only from
+    stderr (and only when the exit code is nonzero) leaves the caller with a bare
+    `reached: false` and no way to know what to fix. Observed on the real cluster:
+    stdout was `必须是唯一的账号 root`.
+    """
+    hosts = [Host(name=n, login="u", asset_id="A", platform="cuda") for n in ("a",)]
+
+    class _Refusing(_FakeSSH):
+        async def exec_on(self, host, command, *, timeout=60.0, workdir=True, env_setup=True):
+            return ExecResult(host.name, 0, "必须是唯一的账号 root\n", "")
+
+    inv = Inventory(hosts={h.name: h for h in hosts}, groups={}, workspaces={})
+    monkeypatch.setitem(S._state, "inv", inv)
+    monkeypatch.setitem(S._state, "ssh", _Refusing({}))
+    r = asyncio.run(S.jms_probe(["all"]))
+    assert r["hosts"][0]["reached"] is False
+    assert "必须是唯一的账号 root" in r["hosts"][0]["error"]
+
+
+def test_failure_reason_prefers_stderr_only_on_a_real_failure():
+    """A successful exit whose stdout is not good enough still needs its stdout."""
+    from jms_bridge.ssh import failure_reason
+
+    # exit 0, message on stdout (a KoKo rejection)
+    assert failure_reason(ExecResult("h", 0, "asset offline\n", "")) == "asset offline"
+    # a genuine failure: stderr is the explanation
+    assert failure_reason(ExecResult("h", 1, "", "boom")) == "boom"
+    # a failure that wrote to stdout anyway
+    assert failure_reason(ExecResult("h", 2, "partial\n", "")) == "partial"
+    # a timeout reports its own message
+    assert failure_reason(ExecResult("h", 124, "", "timed out after 5s", True)) == (
+        "timed out after 5s"
+    )
+
+
+def test_fleet_summary_also_reports_the_koko_reason(monkeypatch):
+    """The same trap in the roll-up tool: an unreachable host must say why."""
+    hosts = [Host(name="a", login="u", asset_id="A", platform="cuda")]
+
+    class _Refusing(_FakeSSH):
+        async def exec_on(self, host, command, *, timeout=60.0, workdir=True, env_setup=True):
+            return ExecResult(host.name, 0, "no permission to access the asset\n", "")
+
+    inv = Inventory(hosts={h.name: h for h in hosts}, groups={}, workspaces={})
+    monkeypatch.setitem(S._state, "inv", inv)
+    monkeypatch.setitem(S._state, "ssh", _Refusing({}))
+    r = asyncio.run(S.jms_fleet_summary(["all"]))
+    assert r["ok"] is False and r["hosts_reachable"] == 0
+    assert "no permission" in r["unreachable"][0]["reason"]
+
+
 def test_probe_isolates_a_host_that_raises(monkeypatch):
     """One host's transport error must not erase the other hosts' probe results."""
     hosts = [Host(name=n, login="u", asset_id="A") for n in ("a", "b")]
@@ -1408,7 +1551,7 @@ def test_probe_isolates_a_host_that_raises(monkeypatch):
     r = asyncio.run(S.jms_probe(["all"]))
     assert [h["host"] for h in r["hosts"]] == ["a", "b"]
     assert r["ok"] is False
-    assert "ssh binary vanished" in r["hosts"][1]["stderr"]
+    assert "ssh binary vanished" in r["hosts"][1]["error"]
     assert r["hosts"][0]["ok"] is True
 
 
@@ -1432,6 +1575,90 @@ def test_exec_on_an_empty_selection_is_not_success(monkeypatch):
     assert r["ok"] is False and r["results"] == []
     assert "matched no host" in r["error"]
     assert fake.calls == []
+
+
+def test_exec_bounds_a_wall_of_output_per_host(monkeypatch):
+    """A fan-out must not forward unbounded stdout into the agent's context.
+
+    `jms_exec(["cluster"], "cat train.log")` across 40 hosts produced an 8 MB (≈2 M token)
+    reply before the per-host cap. The *number* of hosts stays unbounded; only each inline
+    preview is clipped, and the reply says so rather than looking complete.
+    """
+    import json
+
+    hosts = [Host(name=f"n{i}", login="u", asset_id="A") for i in range(40)]
+
+    class _Firehose(_FakeSSH):
+        async def exec_many(self, hosts, command, *, timeout=60.0):
+            return [ExecResult(h.name, 0, "x" * 200_000, "") for h in hosts]
+
+    inv = Inventory(hosts={h.name: h for h in hosts}, groups={}, workspaces={})
+    monkeypatch.setitem(S._state, "inv", inv)
+    monkeypatch.setitem(S._state, "ssh", _Firehose({}))
+    r = asyncio.run(S.jms_exec(["all"], "cat train.log"))
+
+    assert len(r["results"]) == 40
+    blob = json.dumps(r)
+    # The fan-out shares one aggregate budget, so the whole reply stays well under it even
+    # though every host produced 200 KB.
+    assert len(blob) < 500_000, f"reply is {len(blob)} bytes"
+    first = r["results"][0]
+    assert first["stdout_bytes"] == 200_000
+    assert first["stdout_truncated"] is True
+    assert "truncated" in first["stdout"]
+
+
+def test_one_host_cannot_spend_a_fleets_whole_budget(monkeypatch):
+    """A single-host fan-out is still capped at the per-host limit, not the aggregate."""
+    from jms_bridge.ssh import OUTPUT_LIMIT
+
+    hosts = [Host(name="a", login="u", asset_id="A")]
+
+    class _Firehose(_FakeSSH):
+        async def exec_many(self, hosts, command, *, timeout=60.0):
+            return [ExecResult(h.name, 0, "x" * 1_000_000, "") for h in hosts]
+
+    inv = Inventory(hosts={h.name: h for h in hosts}, groups={}, workspaces={})
+    monkeypatch.setitem(S._state, "inv", inv)
+    monkeypatch.setitem(S._state, "ssh", _Firehose({}))
+    r = asyncio.run(S.jms_exec(["all"], "cat huge.log"))
+    assert len(r["results"][0]["stdout"]) <= OUTPUT_LIMIT + 200  # + the marker text
+
+
+def test_a_hosts_two_streams_share_its_budget(monkeypatch):
+    """stdout + stderr together must stay within one host's slice, not two slices."""
+    hosts = [Host(name="a", login="u", asset_id="A")]
+
+    class _Both(_FakeSSH):
+        async def exec_many(self, hosts, command, *, timeout=60.0):
+            return [ExecResult(h.name, 0, "o" * 200_000, "e" * 200_000) for h in hosts]
+
+    inv = Inventory(hosts={h.name: h for h in hosts}, groups={}, workspaces={})
+    monkeypatch.setitem(S._state, "inv", inv)
+    monkeypatch.setitem(S._state, "ssh", _Both({}))
+    r = asyncio.run(S.jms_exec(["all"], "noisy"))
+    entry = r["results"][0]
+    assert entry["stdout_bytes"] == 200_000 and entry["stderr_bytes"] == 200_000
+    assert len(entry["stdout"]) + len(entry["stderr"]) < 17_000, "two streams each took a slice"
+
+
+def test_small_output_is_not_marked_truncated(monkeypatch):
+    """A reply that fits must not claim to be clipped — the flag has to stay honest."""
+    hosts = [Host(name="a", login="u", asset_id="A")]
+
+    class _Small(_FakeSSH):
+        async def exec_many(self, hosts, command, *, timeout=60.0):
+            return [ExecResult(h.name, 0, "hello\n", "") for h in hosts]
+
+    inv = Inventory(hosts={h.name: h for h in hosts}, groups={}, workspaces={})
+    monkeypatch.setitem(S._state, "inv", inv)
+    monkeypatch.setitem(S._state, "ssh", _Small({}))
+    r = asyncio.run(S.jms_exec(["all"], "echo hello"))
+    entry = r["results"][0]
+    assert entry["stdout"] == "hello\n"
+    assert entry["stdout_bytes"] == 6
+    assert entry["stdout_truncated"] is False
+    assert "truncated" not in entry["stdout"]
 
 
 def test_sync_push_on_an_empty_selection_is_not_success(monkeypatch):
@@ -1647,6 +1874,59 @@ def test_create_ticket_spreads_the_type_specific_fields(monkeypatch):
     assert r["ok"] is True and r["ticket"] == {"id": "t1"}
     assert calls[0]["apply_login_user"] == "u"
     assert calls[0]["apply_login_account"] == "root"
+
+
+# --- jms_asset_detail: the account half of a login ----------------------------------
+
+
+def test_asset_detail_returns_accounts_and_a_paste_ready_entry(monkeypatch):
+    """`jms_list_assets` omits accounts; this is how a new inventory gets them.
+
+    The account is the field a user otherwise hunts for in the JumpServer UI, and the
+    per-asset *list* endpoint answers 403 for a normal account on the real server, so the
+    detail call is the one that works.
+    """
+    import yaml as _yaml
+
+    class _FakeAPI:
+        async def get_asset(self, asset_id):
+            assert asset_id == "A1"
+            return {
+                "id": "A1",
+                "name": "node-1",
+                "address": "10.0.0.1",
+                "platform": {"name": "Linux"},
+                "is_active": True,
+                "connectivity": {"value": "ok"},
+                "permed_accounts": [
+                    {"id": "u1", "username": "root", "name": "new-root",
+                     "secret_type": "ssh_key", "has_secret": True},
+                    {"id": "u2", "username": "ops", "name": "ops"},
+                ],
+            }
+
+    monkeypatch.setitem(S._state, "api", _FakeAPI())
+    r = asyncio.run(S.jms_asset_detail("A1"))
+    assert r["ok"] is True
+    assert [a["username"] for a in r["accounts"]] == ["root", "ops"]
+    assert r["asset"]["address"] == "10.0.0.1"
+    # the account with a usable secret is the one filled into the entry
+    assert r["inventory_entry"]["node-1"]["account"] == "root"
+    assert r["inventory_entry"]["node-1"]["asset_id"] == "A1"
+    # and the emitted YAML must actually parse
+    parsed = _yaml.safe_load(r["inventory_yaml"])
+    assert parsed["node-1"]["account"] == "root"
+
+
+def test_asset_detail_lets_the_caller_name_the_host(monkeypatch):
+    class _FakeAPI:
+        async def get_asset(self, asset_id):
+            return {"id": "A1", "name": "ugly-name-123", "permed_accounts": []}
+
+    monkeypatch.setitem(S._state, "api", _FakeAPI())
+    r = asyncio.run(S.jms_asset_detail("A1", host_name="ascend-1"))
+    assert "ascend-1" in r["inventory_entry"]
+    assert r["inventory_entry"]["ascend-1"]["account"] == "<account>"
 
 
 # --- shutdown: the lazily-built clients are closed, and forgotten -------------------

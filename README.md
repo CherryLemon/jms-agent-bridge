@@ -158,8 +158,10 @@ cannot be green while the ids are still the placeholders the template ships — 
 config and control-plane layers to pass and the data plane to fail. Once the login above has
 succeeded, get the ids from `jms_list_assets` inside your agent session (after
 [registering the server](#register-the-mcp-server-with-your-agent)), or from the JumpServer web
-UI, and fill in `asset_id` for each host. Then `jms-bridge doctor` and `jms-bridge probe cluster`
-should both be green.
+UI, and fill in `asset_id` for each host. `jms_asset_detail <asset_id>` returns one asset's
+bound **accounts** — the `#account` half of the login, which the asset list omits — together with
+a paste-ready `hosts.yaml` entry. Then `jms-bridge doctor` and `jms-bridge probe cluster` should
+both be green.
 
 ## Authenticate
 
@@ -280,7 +282,7 @@ add the entry to every profile you want the cluster available in:
         serverName: jms-bridge
         command: /abs/path/to/jms-agent-bridge/.venv/bin/jms-bridge
         args: ['serve']
-        # jms_job_wait's own default is 150s; dsh caps a tool call at 60s unless raised.
+        # dsh caps a tool call at 60s; jms_dev_run defaults to 600s and jms_dev_logs to 300s.
         toolCallTimeoutMs: 300000
 ```
 
@@ -291,9 +293,12 @@ alongside dsh's own tools rather than shadowing them. `/mcp` lists the server an
 
 Two details that are specific to dsh and will otherwise cost you an afternoon:
 
-- **Raise `toolCallTimeoutMs`; the default is 60 000 ms.** That is below `jms_job_wait`'s own
-  150-second default and well under the ~200s ceiling the long tools document, so a bounded wait
-  you asked for would be cut off by dsh first. `300000` (5 min) leaves the tool in charge.
+- **Raise `toolCallTimeoutMs`; the default is 60 000 ms.** `jms_dev_run` defaults to **600 s**
+  and `jms_dev_logs` to **300 s**, so each would be cut off by dsh long before it finished.
+  `jms_job_wait` defaults to 50 s (inside the cap on purpose, so its bounded wait returns its
+  own answer); pass it a larger `timeout` only together with a larger cap. `300000` (5 min)
+  covers the dev loop; the long tools stay under the gateway's ~200 s non-streaming ceiling
+  per call, so a truly long step belongs in `jms_submit_job` / `jms_cluster_submit`.
 - **Secrets must be listed explicitly, because dsh scrubs the parent environment.** Names matching
   `KEY|PASSWORD|SECRET|TOKEN` (case-insensitive) and any `DSH_*` are dropped before the child is
   spawned — so `JMS_BRIDGE_SSH_PASSWORD`, `JMS_BRIDGE_PASSWORD`, `JMS_BRIDGE_SSH_KEY`,
@@ -335,7 +340,7 @@ For dsh the equivalent is the `env:` block on the patch entry, not a flag — se
 ```bash
 claude mcp list          # → jms-bridge: … ✔ Connected
 codex mcp list           # → jms-bridge  …  enabled
-# dsh: /mcp from inside a session → jms-bridge with 24 tools
+# dsh: /mcp from inside a session → jms-bridge with 25 tools
 ```
 
 `✔ Connected` / `enabled` means the agent started the server and completed the MCP handshake, so
@@ -355,12 +360,13 @@ otherwise the bridge starts up holding a token the server may no longer accept.
 
 ## Tools
 
-24 tools, grouped by what they act on. "REST" = control plane (JumpServer API, metadata only);
+25 tools, grouped by what they act on. "REST" = control plane (JumpServer API, metadata only);
 "SSH" = data plane (real execution through the KoKo gateway).
 
 | Tool | Plane | What it does |
 |---|---|---|
 | `jms_list_assets` | REST | Assets this account can reach (id, name, address, platform) — for building the inventory |
+| `jms_asset_detail` | REST | One asset's bound **accounts** (the `#account` in a login) + a paste-ready `hosts.yaml` entry |
 | `jms_audit_query` | REST | Recent command records — "what did the agent run?" |
 | `jms_create_ticket` | REST | Raise an approval ticket when policy gates an action |
 | `jms_probe` | SSH | Liveness + accelerator + version across a host set (a KoKo rejection is reported as unreachable, not as a healthy host) |

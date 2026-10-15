@@ -21,9 +21,10 @@
         serverName: jms-bridge
         command: /abs/path/to/jms-agent-bridge/.venv/bin/jms-bridge
         args: ['serve']
-        # dsh defaults to 60000ms, which is below jms_job_wait's own 150s default
-        # and the ~200s ceiling the long tools document — raise it or the wait you
-        # asked for is cut off by the harness first.
+        # dsh defaults to 60000ms, which is below jms_dev_run's 600s and
+        # jms_dev_logs' 300s defaults — raise it or those are cut off by the
+        # harness first. (jms_job_wait defaults to 50s, inside the cap on
+        # purpose: a bounded wait should return its own answer, not time out.)
         toolCallTimeoutMs: 300000
         # dsh scrubs KEY/PASSWORD/SECRET/TOKEN (and DSH_*) names from the parent
         # environment, so any JMS_BRIDGE_* secret must be listed here explicitly.

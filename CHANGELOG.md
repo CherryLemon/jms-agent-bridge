@@ -4,6 +4,22 @@
 
 ### Added
 
+- **`jms_asset_detail` — one asset's accounts, and a paste-ready `hosts.yaml` entry.**
+  `jms_list_assets` deliberately omits accounts (it is one REST request, and enumerating
+  `#account` per asset would be one request each), but the account is exactly the field a
+  new inventory is missing — and the obvious endpoint for it answers **403** to a normal
+  account. The asset detail endpoint carries `permed_accounts` in the same single request,
+  so this tool returns the accounts, the asset metadata, and the YAML block to paste under
+  `hosts:`. `platform` is deliberately left a placeholder: JumpServer's platform name does
+  not say which accelerator to probe, and a wrong guess silently reports a healthy host
+  with no accelerator.
+- **Long tools now report MCP progress.** `jms_dev_run` (per chip) and `jms_dev_discover`
+  (per host) previously produced nothing until they finished, so a fleet-wide run was
+  indistinguishable from a hang. Progress is client-opt-in (MCP delivers it only to a
+  client that registered a progress callback) and best-effort by design — a client without
+  support, or a direct call outside a live request, must not fail the work, so the
+  notification is swallowed rather than propagated. Verified end to end over a real stdio
+  session: three reports for a three-step tool.
 - **Every tool now carries MCP annotations, and the server publishes instructions.** All
   24 tools previously shipped `annotations: null`, so a client had no way to tell an
   inspection call from one that spawns or kills work. The eleven read-only tools
@@ -46,6 +62,37 @@
 
 ### Fixed
 
+- **`jms_probe` reported an unreachable host with no reason, and could call a failed probe
+  healthy.** The sentinel fix caught the KoKo-rejection-as-green bug, but the *explanation*
+  was still dropped: KoKo puts it on **stdout** ("必须是唯一的账号 root"), while the tool
+  consulted only stderr, and only when the exit code was nonzero — so `reached: false` came
+  with an empty `error` and the caller could see that a host failed but not what to fix. One
+  `ssh.failure_reason` helper now serves every reachability site (`jms_probe`,
+  `jms_fleet_summary`, `doctor`, `ssh-key --verify`, `probe`), prefers stderr only when the
+  command genuinely failed, and the probe entry's field is renamed `error` (it is not always
+  stderr). Verified against a host the real deployment rejects.
+- **A tool reply could be arbitrarily large — one call produced 8 MB (≈2 M tokens).**
+  `ExecResult.to_dict` forwarded stdout/stderr whole, and `jms_exec` / `jms_sync_push` /
+  `jms_sync_pull` fan it out across the fleet, so `jms_exec(["cluster"], "cat
+  train.log")` over 40 hosts returned 8 MB into the agent's context. Every other reply in
+  the codebase was already bounded (`[:400]`, `[:20000]`); these three were not. A fan-out
+  now shares one aggregate budget split across hosts (with a per-host floor), each host's
+  two streams share *its* slice, and a clipped stream reports its true size
+  (`stdout_bytes`) plus an explicit `truncated` flag and marker — so a partial result can
+  never read as a complete one. Measured: 8.0 MB → 0.41 MB at 40 hosts, and bounded at any
+  fleet size.
+- **`jms_job_logs` sent its payload twice.** Adding an `outputSchema` to a tool whose
+  payload is a large text blob doubled the reply — the SDK sends a structured result
+  *alongside* the text block, measured at 100 KB of log crossing the wire as 200 KB. A
+  blob tool gains nothing from a schema (the fields are already in the text), so
+  `jms_job_logs` is unstructured again and a test keeps it that way.
+- **`jms_job_wait`'s default timeout exceeded the tightest client cap.** It defaulted to
+  150 s while dsh caps a tool call at 60 s by default, so the bounded wait was killed by
+  the harness before it could return its own partial answer — the user saw a transport
+  error instead of `finished: false`. The default is now 50 s, inside the cap, and a test
+  asserts it stays there. The README's dsh section also named only `jms_job_wait`, missing
+  `jms_dev_run` (600 s) and `jms_dev_logs` (300 s) — the dev-loop tools a user raises the
+  cap for; all three are now documented.
 - **`jms_probe` (and `jms-bridge probe`) reported a KoKo-rejected asset as a healthy,
   accelerator-less host.** KoKo refuses a connection (no permission, asset offline, bad
   address) with ssh **exit 0** and the error on stdout, so a status-only check is green on

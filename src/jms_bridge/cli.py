@@ -24,7 +24,7 @@ from .api import JumpServerAPI, JumpServerError
 from .config import ConfigError, config_path, inventory_path, load_config
 from .inventory import Inventory, InventoryError
 from .platforms import PLATFORMS
-from .ssh import REACH_PROBE, REACH_SENTINEL, SSHRunner, reached
+from .ssh import REACH_PROBE, REACH_SENTINEL, SSHRunner, failure_reason, reached
 
 #: Printed by the ``doctor`` data-plane probe and required back in the reply — see
 #: :data:`jms_bridge.ssh.REACH_SENTINEL` for why the exit code alone cannot be trusted.
@@ -260,7 +260,7 @@ async def _verify_ssh_key(key: Path, targets: list[str]) -> int:
             # REACH_SENTINEL), so a status-only check would call a refused asset green.
             is_up = reached(res)
             mark = "OK  " if is_up else "FAIL"
-            detail = res.stdout.strip() or res.stderr.strip()[:200]
+            detail = failure_reason(res)[:200]
             print(f"  {host.name:20} {mark} {detail}")
             ok = ok and is_up
     except (InventoryError, ConfigError) as exc:
@@ -431,7 +431,7 @@ async def cmd_doctor(args: argparse.Namespace) -> int:
             # the error on stdout, and trusting that would report a dead asset green.
             is_up = reached(res)
             mark = "OK  " if is_up else "FAIL"
-            print(f"  {h.name:20} {mark} {res.stdout.strip() or res.stderr.strip()[:200]}")
+            print(f"  {h.name:20} {mark} {failure_reason(res)[:200]}")
             ok = ok and is_up
     except Exception as exc:  # noqa: BLE001 - doctor reports, never raises
         print(f"  data plane   FAIL {exc}")
@@ -460,7 +460,7 @@ async def cmd_probe(args: argparse.Namespace) -> int:
             body = res.stdout.replace(f"{REACH_SENTINEL}\n", "", 1)
             print(f"### {host.name} [{platform.name}]  exit={res.exit_code}")
             if not served:
-                print(f"    UNREACHABLE: {(res.stdout or res.stderr).strip()[:400]}")
+                print(f"    UNREACHABLE: {failure_reason(res)[:400]}")
                 ok = False
             elif res.ok:
                 for k, v in platform.parse_probe(body).items():

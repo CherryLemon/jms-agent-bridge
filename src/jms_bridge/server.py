@@ -23,7 +23,8 @@ import subprocess
 from collections.abc import Callable
 from typing import Any, TypedDict, TypeVar
 
-from mcp.server.mcpserver import MCPServer
+import yaml
+from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
@@ -40,7 +41,15 @@ from .config import BastionConfig, ConfigError, load_config
 from .discover import DEFAULT_REPO_MATCH
 from .inventory import Host, Inventory, InventoryError, shell_quote
 from .jobs import JobManager, validate_job_id
-from .ssh import REACH_PROBE, REACH_SENTINEL, ExecResult, SSHRunner, reached
+from .ssh import (
+    OUTPUT_LIMIT,
+    REACH_PROBE,
+    REACH_SENTINEL,
+    ExecResult,
+    SSHRunner,
+    failure_reason,
+    reached,
+)
 from .workspace import CONTAINER_RE, DEFAULT_CONTAINER, SOURCES
 
 log = logging.getLogger("jms_bridge.server")
@@ -118,18 +127,6 @@ class ClusterSubmitOut(_Refusal, total=False):
     unready: list[dict]
     ready_targets: list[str]
     busy: list[dict]
-
-
-class JobLogsOut(_Refusal, total=False):
-    """``jms_job_logs``: the incremental read and the resume point."""
-
-    host: str
-    job_id: str
-    offset: int
-    size: int
-    next_offset: int
-    log: str
-    exit_code: int
 
 
 # The version is what a client shows in `/mcp` and what a bug report quotes back, so it
@@ -216,6 +213,30 @@ def _tool(
     return decorate
 
 
+async def _progress(ctx: Context | None, done: float, total: float, message: str) -> None:
+    """Best-effort MCP progress notification for a long tool.
+
+    A long fan-out (`jms_dev_run` across a fleet) otherwise looks indistinguishable from a
+    hang: the client shows a spinner and the user cannot tell "still working" from "dead".
+    Reporting each completed host turns that into visible movement.
+
+    Progress is **client-opt-in**: MCP delivers it only when the client registers a progress
+    callback (which is what puts a progress token on the request). A client that does not
+    simply receives nothing, which is why this is a nicety rather than a contract.
+
+    Swallowed on failure by design. ``Context.report_progress`` raises when there is no live
+    request (a direct call from a test or an embedder), and a client that does not implement
+    progress is not an error — neither is worth failing the work over, so progress is
+    advisory in exactly the way the work is not.
+    """
+    if ctx is None:
+        return
+    try:
+        await ctx.report_progress(done, total, message)
+    except Exception:  # noqa: BLE001 - progress must never break the operation
+        log.debug("progress report failed", exc_info=True)
+
+
 # --- lazily-initialised singletons ------------------------------------------------
 
 _state: dict[str, Any] = {}
@@ -283,8 +304,8 @@ async def jms_list_assets(search: str | None = None) -> dict:
     Use this to discover the ``asset_id`` values the inventory needs. Returns each
     asset's id, name, address and platform. Bound accounts are *not* included — this
     call is one REST request, and enumerating the ``#account`` part of every login
-    would be one request per asset. For a single asset, either read it from the
-    JumpServer UI or use the asset's detail endpoint.
+    would be one request per asset. For one asset's accounts (the ``#account`` in a
+    login), call `jms_asset_detail`.
     """
     api = _api()
     try:
@@ -304,6 +325,82 @@ async def jms_list_assets(search: str | None = None) -> dict:
             }
         )
     return {"ok": True, "count": len(out), "assets": out}
+
+
+@_tool(read_only=True)
+async def jms_asset_detail(asset_id: str, host_name: str | None = None) -> dict:
+    """One asset's bound accounts and a paste-ready `hosts.yaml` entry.
+
+    `jms_list_assets` gives ids, names and addresses, but *not* the ``account`` half of
+    the per-asset login ``<login>#<account>#<asset_id>`` — which is exactly the field a
+    new inventory is missing, and the one a user otherwise has to hunt for in the
+    JumpServer UI. The asset's own detail endpoint carries it, so this is still **one**
+    REST request.
+
+    Use the account this returns (``accounts[].username``, preferring an entry whose
+    ``secret_type`` is set) as ``account:`` in the host entry. `inventory_entry` is the
+    YAML block to paste under ``hosts:``; it leaves ``platform`` to you, because the
+    accelerator tag cannot be inferred from JumpServer's platform name and a wrong guess
+    probes with the wrong tool (see `jms_dev_discover` / the platform list in the README).
+
+    Prefer this over a per-asset account *list* endpoint, which in practice is not
+    exposed to a normal account (it answers 403); the detail call is.
+    """
+    api = _api()
+    try:
+        asset = await api.get_asset(asset_id)
+    except JumpServerError as exc:
+        return {"ok": False, "error": str(exc), "asset_id": asset_id}
+
+    accounts = []
+    for acc in asset.get("permed_accounts") or []:
+        accounts.append(
+            {
+                "username": acc.get("username"),
+                "name": acc.get("name"),
+                "id": acc.get("id"),
+                # A `secret_type` means the account has a credential JumpServer can use.
+                "secret_type": acc.get("secret_type"),
+                "has_secret": acc.get("has_secret"),
+            }
+        )
+    platform = asset.get("platform")
+    name = host_name or asset.get("name") or asset_id
+    # Prefer an account that actually has a secret; that is the one that can log in.
+    usable = [a for a in accounts if a.get("has_secret")] or accounts
+    account = usable[0]["username"] if usable else None
+    entry = {
+        "login": "<your JumpServer login>",
+        "account": account or "<account>",
+        "asset_id": asset_id,
+        "platform": "<accelerator profile, e.g. ascend-910c | cuda | kunlunxin>",
+        # Placeholders are wrapped in <> so a half-edited paste is obvious; a bare
+        # `~/your-workdir` reads like a real path and would ship as one.
+        "env_setup": "<source /path/to/env.sh>",
+        "workdir": "<~/your-workdir>",
+        "tags": ["<tag>"],
+    }
+    return {
+        "ok": True,
+        "asset": {
+            "id": asset.get("id"),
+            "name": asset.get("name"),
+            "address": asset.get("address"),
+            "platform": platform.get("name") if isinstance(platform, dict) else platform,
+            "active": asset.get("is_active"),
+            "connectivity": (asset.get("connectivity") or {}).get("value")
+            if isinstance(asset.get("connectivity"), dict)
+            else asset.get("connectivity"),
+        },
+        "accounts": accounts,
+        "inventory_entry": {name: entry},
+        "inventory_yaml": yaml.safe_dump({name: entry}, sort_keys=False),
+        "note": (
+            "platform is left blank on purpose: JumpServer's platform name does not say "
+            "which accelerator profile to probe, and guessing wrong silently reports a "
+            "healthy host with no accelerator. Set it from the host's chip."
+        ),
+    }
 
 
 @_tool(read_only=True)
@@ -387,6 +484,38 @@ async def jms_create_ticket(
 # --- data plane: probe / exec -----------------------------------------------------
 
 
+def _per_host_output_budget(host_count: int) -> int:
+    """The stdout/stderr budget for one host in a fan-out of ``host_count``.
+
+    A per-host cap alone does not bound the reply: 40 hosts at the 16 KB cap is still
+    ~650 KB (≈160 k tokens), and a 90-host fleet is worse. So a fan-out shares one
+    aggregate budget (see :data:`_AGGREGATE_OUTPUT_BUDGET`) split equally across hosts,
+    with a floor so a wide fleet still shows each host a useful preview rather than a few
+    bytes. Every clipped host reports its true `*_bytes`, so the caller can always tell it
+    is looking at a slice.
+    """
+    if host_count <= 0:
+        return OUTPUT_LIMIT
+    # Never *more* than one host's own cap, even for a single-host fan-out: the aggregate
+    # budget is a fleet-level bound, not a licence for one host to emit 400 KB.
+    return min(OUTPUT_LIMIT, max(_MIN_PER_HOST, _AGGREGATE_OUTPUT_BUDGET // host_count))
+
+
+#: Total characters the `stdout`/`stderr` previews of one fan-out reply may spend across
+#: all hosts — roughly 100 k tokens, large enough to diagnose a fleet and small enough
+#: that a single call cannot evict a client's context.
+_AGGREGATE_OUTPUT_BUDGET = 400_000
+
+#: Floor for one host's slice, so a 90-host fan-out still shows each host something.
+_MIN_PER_HOST = 2_000
+
+
+def _fanout_reply(results: list[ExecResult]) -> list[dict]:
+    """Per-host reply entries, sharing one aggregate output budget across the fleet."""
+    budget = _per_host_output_budget(len(results))
+    return [r.to_dict(limit=budget) for r in results]
+
+
 @_tool(read_only=True)
 async def jms_probe(targets: list[str]) -> dict:
     """Probe hosts for liveness, accelerator type and driver/runtime version.
@@ -421,19 +550,21 @@ async def jms_probe(targets: list[str]) -> dict:
                 "host": host.name,
                 "platform": platform.name,
                 "ok": False,
+                "reached": False,
                 "exit_code": None,
-                "stderr": f"{type(exc).__name__}: {exc}"[:400],
+                "error": f"{type(exc).__name__}: {exc}"[:400],
             }
         served = reached(res)
         # Strip the sentinel line so `raw` (and any parser fed by it) sees only the
         # platform command's own output.
         body = res.stdout.replace(f"{REACH_SENTINEL}\n", "", 1)
         parsed = platform.parse_probe(body) if served else {}
-        # A reached host whose platform command *failed* is still a failure to probe;
-        # report the difference rather than collapsing both into one flag.
-        detail = res.stderr.strip()[:400] if not res.ok else ""
-        if served and not res.ok:
-            detail = detail or "probe command failed on the host"
+        # Report *why* a host did not answer. A KoKo rejection puts its explanation on
+        # stdout ("必须是唯一的账号 root"), so taking stderr only when `res.ok` is false
+        # would leave the caller with a bare `reached: false` and nothing to act on.
+        detail = ""
+        if not (served and res.ok):
+            detail = failure_reason(res)
         return {
             "host": host.name,
             "platform": platform.name,
@@ -441,7 +572,9 @@ async def jms_probe(targets: list[str]) -> dict:
             "reached": served,
             "exit_code": res.exit_code,
             **parsed,
-            "stderr": detail,
+            # Named `error`, not `stderr`: a KoKo rejection puts its reason on stdout, so
+            # the field that explains a failure does not always come from stderr.
+            "error": detail,
         }
 
     results = list(await asyncio.gather(*(one(h) for h in hosts)))
@@ -503,7 +636,7 @@ async def jms_fleet_summary(targets: list[str], probe: bool = True) -> dict:
         try:
             res = await ssh.exec_on(host, f"{REACH_PROBE} && hostname", timeout=45)
             is_up = reached(res)
-            reason = "" if is_up else (res.stdout or res.stderr or "").strip()[:200]
+            reason = "" if is_up else failure_reason(res)[:200]
         except Exception as exc:  # noqa: BLE001 - a transport failure is just unreachable
             is_up, reason = False, f"{type(exc).__name__}: {exc}"[:200]
         count = None
@@ -556,7 +689,7 @@ async def jms_exec(
     if not hosts:
         return _empty_refusal(targets, results=[])
     results = await _ssh().exec_many(hosts, command, timeout=timeout)
-    return {"ok": all(r.ok for r in results), "results": [r.to_dict() for r in results]}
+    return {"ok": all(r.ok for r in results), "results": _fanout_reply(results)}
 
 
 # --- data plane: file sync --------------------------------------------------------
@@ -580,7 +713,7 @@ async def jms_sync_push(
     if not hosts:
         return _empty_refusal(targets, results=[])
     results = await _gather_rsync(hosts, local, remote, "push", excludes, delete)
-    return {"ok": all(r.ok for r in results), "results": [r.to_dict() for r in results]}
+    return {"ok": all(r.ok for r in results), "results": _fanout_reply(results)}
 
 
 @_tool(idempotent=True)
@@ -592,7 +725,7 @@ async def jms_sync_pull(
     if not hosts:
         return _empty_refusal(targets, results=[])
     results = await _gather_rsync(hosts, local, remote, "pull", excludes or [], False)
-    return {"ok": all(r.ok for r in results), "results": [r.to_dict() for r in results]}
+    return {"ok": all(r.ok for r in results), "results": _fanout_reply(results)}
 
 
 async def _gather_rsync(hosts, local, remote, direction, excludes, delete):  # noqa: ANN001
@@ -781,8 +914,16 @@ async def jms_job_status(targets: list[str], job_id: str) -> JobStatusOut:
 @_tool(read_only=True)
 async def jms_job_logs(
     host: str, job_id: str, offset: int = 0, max_bytes: int = 65536
-) -> JobLogsOut:
-    """Read a job's log from `offset` onward. Poll with the returned `next_offset`."""
+) -> dict:
+    """Read a job's log from `offset` onward. Poll with the returned `next_offset`.
+
+    Deliberately *unstructured* (no `outputSchema`): a tool whose payload is a text blob
+    gets no field-discoverability benefit from a schema, but does pay its cost — a
+    structured result is sent alongside the text block, so the log would cross the wire
+    twice. Measured at ~100 KB of log that is a doubled reply for nothing. The tools whose
+    payload is a small record per host (`jms_job_status`, `jms_cluster_preflight`, …) keep
+    their schema.
+    """
     bad = validate_job_id(job_id)
     if bad:
         return {"ok": False, "error": bad}
@@ -812,7 +953,7 @@ async def jms_job_cancel(host: str, job_id: str) -> dict:
 
 @_tool(read_only=True)
 async def jms_job_wait(
-    targets: list[str], job_id: str, timeout: float = 150.0, interval: float = 2.0
+    targets: list[str], job_id: str, timeout: float = 50.0, interval: float = 2.0
 ) -> dict:
     """Block until a job has stopped on every targeted host, or `timeout` elapses.
 
@@ -822,8 +963,11 @@ async def jms_job_wait(
     all stopped; a timeout is not a failure and **kills nothing**, so on `finished=false`
     the jobs are still running and you can call this again or keep polling manually.
 
-    Keep `timeout` under ~200s: the gateway buffers a non-streaming response, so a tool
-    call that runs longer is cut off by the transport rather than by this timeout.
+    The default is deliberately below the tightest client tool-call cap we know of (dsh's
+    60 s), so a bounded wait returns its partial answer *itself* instead of being cut off
+    by the client first — the difference between `finished: false` and an opaque timeout.
+    Raising `timeout` past that also requires raising the client's cap (`toolCallTimeoutMs`
+    in dsh), and the gateway buffers a non-streaming response for ~200 s, so stay under it.
     """
     hosts = _resolve(targets)
     bad = validate_job_id(job_id)
@@ -1084,6 +1228,7 @@ async def jms_dev_run(
     timeout: float = 600.0,
     ut_cmd: str | None = None,
     allow_dangerous: bool = False,
+    ctx: Context | None = None,
 ) -> DevRunOut:
     """Deliver `ref` to every workspace, run the UT suite in each container, and
     return ONE cross-chip consistency table.
@@ -1210,6 +1355,12 @@ async def jms_dev_run(
         )
         return ws.name, res, parse_pytest_summary(res.stdout)
 
+    # Progress: a fleet-wide UT run takes minutes, and without this the client sees only a
+    # spinner — indistinguishable from a hang. Count chips as they finish so the user sees
+    # movement (and, when one chip is stuck, which one is outstanding).
+    total = len(workspaces)
+    done_count = 0
+
     async def _one(ws):  # noqa: ANN001, ANN202
         """Run one chip, turning a raise into *that chip's* failure.
 
@@ -1218,10 +1369,14 @@ async def jms_dev_run(
         replace the whole cross-chip table — this tool's entire product — with an
         opaque tool error. Here the chip is reported as failed and the table survives.
         """
+        nonlocal done_count
         try:
             return await _run_one(ws)
         except Exception as exc:  # noqa: BLE001 - isolating one chip is the point
             return ws.name, ExecResult(ws.name, 1, "", f"run failed: {exc}"), {}
+        finally:
+            done_count += 1
+            await _progress(ctx, done_count, total, f"{done_count}/{total} chips done")
 
     ran = await asyncio.gather(*(_one(w) for w in workspaces))
     per_ws = {name: parsed for name, _, parsed in ran}
@@ -1336,6 +1491,7 @@ async def jms_dev_discover(
     mount: str | None = None,
     local: str | None = None,
     timeout: float = 120.0,
+    ctx: Context | None = None,
 ) -> dict:
     """Inspect each host's container and emit a paste-ready `workspaces:` block.
 
@@ -1396,16 +1552,24 @@ async def jms_dev_discover(
             yaml="",
         )
     script = build_discovery_script(container, repo_match=repo_match, max_depth=max_depth)
-    results = await asyncio.gather(
-        *(
+    # Discovery runs one `docker exec` per host and can take minutes on a wide fleet, so
+    # report progress per host rather than leaving the client with a bare spinner.
+    total = len(hosts)
+    done_count = 0
+
+    async def _discover_one(h: Host):
+        nonlocal done_count
+        try:
             # Discovery must not depend on the host toolchain (env_setup) nor the
             # host workdir — it inspects a container, which is host-toolchain-free.
-            _ssh().exec_on(
+            return await _ssh().exec_on(
                 h, script, timeout=timeout, workdir=False, env_setup=False
             )
-            for h in hosts
-        )
-    )
+        finally:
+            done_count += 1
+            await _progress(ctx, done_count, total, f"{done_count}/{total} hosts inspected")
+
+    results = await asyncio.gather(*(_discover_one(h) for h in hosts))
     reports = [
         {
             "host": res.host,

@@ -91,6 +91,28 @@ _BASE_OPTS = [
 _BATCH_MODE = ["-o", "BatchMode=yes"]
 
 
+#: Character budget for the stdout/stderr of one host in a fan-out reply.
+#:
+#: A tool result is consumed by an agent, not a human at a terminal, and a plain
+#: `cat train.log` across 40 hosts produced an 8 MB (≈2 M token) reply — enough to blow
+#: any client's context. The cap is per host and per stream, so the *number* of hosts a
+#: caller may fan out to is unaffected; only the inline preview is bounded.
+OUTPUT_LIMIT = 16_000
+
+
+def _clip(text: str, limit: int = OUTPUT_LIMIT) -> tuple[str, int]:
+    """Return ``(preview, total_chars)``; the preview ends with an explicit marker.
+
+    The marker is not decoration: an agent that cannot tell a clipped log from a whole one
+    will reason about a partial result as if it were complete. The true length is returned
+    alongside so the caller can also report it as a number.
+    """
+    if len(text) <= limit:
+        return text, len(text)
+    head = text[:limit]
+    return f"{head}\n… [truncated: showing {limit} of {len(text)} chars]", len(text)
+
+
 @dataclass
 class ExecResult:
     host: str
@@ -103,14 +125,33 @@ class ExecResult:
     def ok(self) -> bool:
         return self.exit_code == 0 and not self.timed_out
 
-    def to_dict(self) -> dict:
+    def to_dict(self, *, limit: int = OUTPUT_LIMIT) -> dict:
+        """The per-host reply entry, with stdout/stderr bounded for an agent consumer.
+
+        ``limit`` is the total for this host across **both** streams, not per stream: a
+        host that wrote 1 MB to stdout and 1 MB to stderr must not spend double its share
+        of a fan-out's budget. stdout is served first (it is the payload a caller asked
+        for) and stderr gets whatever remains, so the pair never exceeds ``limit``.
+
+        `stdout_bytes` / `stderr_bytes` report the true sizes and
+        `stdout_truncated` / `stderr_truncated` say whether a preview is partial, so a
+        clipped stream can never be mistaken for a complete one.
+        """
+        out, out_len = _clip(self.stdout, limit)
+        # Give stderr what stdout did not use, so the two together stay within `limit`.
+        remaining = max(0, limit - len(out))
+        err, err_len = _clip(self.stderr, remaining) if remaining else ("", len(self.stderr))
         return {
             "host": self.host,
             "ok": self.ok,
             "exit_code": self.exit_code,
             "timed_out": self.timed_out,
-            "stdout": self.stdout,
-            "stderr": self.stderr,
+            "stdout": out,
+            "stderr": err,
+            "stdout_bytes": out_len,
+            "stderr_bytes": err_len,
+            "stdout_truncated": out_len > len(out),
+            "stderr_truncated": err_len > len(err),
         }
 
 
@@ -124,6 +165,24 @@ def reached(res: ExecResult) -> bool:
     codebase goes through here, so the rule cannot drift apart between tools.
     """
     return res.ok and REACH_SENTINEL in res.stdout
+
+
+def failure_reason(res: ExecResult) -> str:
+    """Why a command did not succeed — the text a caller should show the user.
+
+    A rejection's explanation is on **stdout**, not stderr: KoKo reports "no permission",
+    "asset offline" or "必须是唯一的账号 root" there, and exits **0** while doing it. Looking
+    only at stderr (and only when ``res.ok`` is false) therefore discards the one sentence
+    that says what to fix. So: prefer stderr when the command genuinely failed, else
+    stdout — which is either the rejection text or the sentinel-prefixed output that a
+    caller has already decided is not good enough. Trimmed, because a banner can precede
+    the real message.
+    """
+    if res.timed_out:
+        return res.stderr.strip()[:400] or "timed out"
+    if not res.ok:
+        return (res.stderr or res.stdout).strip()[:400]
+    return res.stdout.strip()[:400]
 
 
 class SSHRunner:
