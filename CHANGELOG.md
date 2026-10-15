@@ -62,6 +62,23 @@
 
 ### Fixed
 
+- **A self-review of the fixes above found three of them half-done.** Each was a case of
+  the right intent applied inconsistently, so the corrections are recorded rather than
+  quietly folded in:
+  1. `list_assets` bounded its pagination walk at ten pages and then returned the result
+     as though it were complete — reintroducing, in the fix for silent truncation, exactly
+     the silent truncation it was fixing (a 5000-asset deployment returned 2000 with no
+     signal). It now returns `(assets, truncated)`; `truncated` is True only when the walk
+     stopped while the server still offered a `next` page, and `jms_list_assets` surfaces
+     that as a `warning` — not an `error`, since the call succeeded and this surface
+     reserves `error` for refusals.
+  2. `jms_asset_detail` shipped its inventory entry twice — once as `inventory_entry` (a
+     dict) and once as `inventory_yaml` — which is the same needless duplication the
+     `jms_job_logs` fix above removed, committed in the same batch. Only the YAML remains;
+     a caller wanting a dict can parse it.
+  3. `jms_asset_detail` returned a 211-character constant `note` on every call, restating
+     guidance already in its docstring. Removed; the explanation lives in the docstring,
+     which is where a client reads it once rather than per response.
 - **`jms_probe` reported an unreachable host with no reason, and could call a failed probe
   healthy.** The sentinel fix caught the KoKo-rejection-as-green bug, but the *explanation*
   was still dropped: KoKo puts it on **stdout** ("必须是唯一的账号 root"), while the tool
@@ -115,8 +132,9 @@
   caller already renders as a message.
 - **`jms_list_assets` silently truncated at 200 assets.** The first page was returned as
   though it were the whole fleet; a deployment with 250 permitted assets showed 200 with
-  nothing to say so. `list_assets` now follows DRF `next`/`offset` pagination (bounded, so
-  a misreported `next` cannot loop forever) and still handles the older bare-list shape.
+  nothing to say so. `list_assets` now follows DRF `next`/`offset` pagination and still
+  handles the older bare-list shape. (The runaway guard added here was itself silently
+  truncating; see the self-review note below for the correction.)
 - **`jms_job_logs` reported `ok: true` on a host it never read.** An unreachable host
   returns an empty body, indistinguishable from a job that has not logged yet, so the tool
   hard-coded a green that was really "we learned nothing". `JobManager.logs` now reports

@@ -1831,6 +1831,34 @@ def test_preflight_world_size_matches_what_submit_would_launch(monkeypatch):
     assert pf["world_size_estimate"] == sub["world_size"] == 4
 
 
+# --- control plane: jms_list_assets must not present a prefix as the whole fleet ------
+
+
+def test_list_assets_tool_flags_a_truncated_listing(monkeypatch):
+    """A partial inventory must say so in the reply, not just `ok: true`."""
+    class _FakeAPI:
+        async def list_assets(self, search=None):
+            return [{"id": "a", "name": "n"}], True
+
+    monkeypatch.setitem(S._state, "api", _FakeAPI())
+    r = asyncio.run(S.jms_list_assets())
+    assert r["ok"] is True            # the call succeeded...
+    assert r["truncated"] is True
+    assert "prefix" in r["warning"]   # ...but the result is a prefix, and says so
+    assert "error" not in r           # `error` is reserved for refusals
+
+
+def test_list_assets_tool_is_quiet_when_the_listing_is_complete(monkeypatch):
+    class _FakeAPI:
+        async def list_assets(self, search=None):
+            return [{"id": "a", "name": "n"}], False
+
+    monkeypatch.setitem(S._state, "api", _FakeAPI())
+    r = asyncio.run(S.jms_list_assets())
+    assert r["ok"] is True and r["truncated"] is False
+    assert "warning" not in r and "error" not in r
+
+
 # --- control plane: jms_create_ticket payload assembly ------------------------------
 
 
@@ -1910,23 +1938,25 @@ def test_asset_detail_returns_accounts_and_a_paste_ready_entry(monkeypatch):
     assert r["ok"] is True
     assert [a["username"] for a in r["accounts"]] == ["root", "ops"]
     assert r["asset"]["address"] == "10.0.0.1"
-    # the account with a usable secret is the one filled into the entry
-    assert r["inventory_entry"]["node-1"]["account"] == "root"
-    assert r["inventory_entry"]["node-1"]["asset_id"] == "A1"
-    # and the emitted YAML must actually parse
+    # The entry is emitted once, as YAML, and must parse back to what it claims.
+    assert "inventory_entry" not in r, "the same entry shipped twice"
     parsed = _yaml.safe_load(r["inventory_yaml"])
-    assert parsed["node-1"]["account"] == "root"
+    assert parsed["node-1"]["account"] == "root"   # the account with a usable secret
+    assert parsed["node-1"]["asset_id"] == "A1"
 
 
 def test_asset_detail_lets_the_caller_name_the_host(monkeypatch):
+    import yaml as _yaml
+
     class _FakeAPI:
         async def get_asset(self, asset_id):
             return {"id": "A1", "name": "ugly-name-123", "permed_accounts": []}
 
     monkeypatch.setitem(S._state, "api", _FakeAPI())
     r = asyncio.run(S.jms_asset_detail("A1", host_name="ascend-1"))
-    assert "ascend-1" in r["inventory_entry"]
-    assert r["inventory_entry"]["ascend-1"]["account"] == "<account>"
+    parsed = _yaml.safe_load(r["inventory_yaml"])
+    assert "ascend-1" in parsed
+    assert parsed["ascend-1"]["account"] == "<account>"
 
 
 # --- shutdown: the lazily-built clients are closed, and forgotten -------------------

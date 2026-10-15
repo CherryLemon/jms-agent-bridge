@@ -233,8 +233,9 @@ def test_list_assets_follows_pagination(monkeypatch):
         return {"count": 3, "next": None, "results": [{"id": "c"}]}
 
     monkeypatch.setattr(api, "request", fake_request)
-    assets = asyncio.run(api.list_assets(limit=2))
+    assets, truncated = asyncio.run(api.list_assets(limit=2))
     assert [a["id"] for a in assets] == ["a", "b", "c"]
+    assert truncated is False, "a full walk must not report truncation"
     assert [c.get("offset", 0) for c in calls] == [0, 2]
 
 
@@ -250,13 +251,20 @@ def test_list_assets_stops_on_a_bare_list(monkeypatch):
         return [{"id": "a"}, {"id": "b"}]
 
     monkeypatch.setattr(api, "request", fake_request)
-    assets = asyncio.run(api.list_assets(limit=2))
+    assets, truncated = asyncio.run(api.list_assets(limit=2))
     assert [a["id"] for a in assets] == ["a", "b"]
+    assert truncated is False
     assert len(calls) == 1  # no second request for a bare list
 
 
-def test_list_assets_bounds_the_walk(monkeypatch):
-    """A server that always claims another page must not loop forever."""
+def test_list_assets_bounds_the_walk_and_says_it_was_truncated(monkeypatch):
+    """A server that always claims another page must not loop forever — and the caller
+    must be told the walk stopped early, not handed a prefix as though it were complete.
+
+    This is the bug the truncation flag exists for: the first version of this fix bounded
+    the walk but kept the truncation silent, so a 5000-asset deployment returned 2000 with
+    nothing to say so.
+    """
     import asyncio
 
     api = JumpServerAPI(BastionConfig(url="https://x", private_token="TOK"))
@@ -267,8 +275,28 @@ def test_list_assets_bounds_the_walk(monkeypatch):
         return {"count": 9999, "next": "https://x/always", "results": [{"id": "x"}]}
 
     monkeypatch.setattr(api, "request", fake_request)
-    asyncio.run(api.list_assets(limit=1, max_pages=3))
-    assert len(calls) == 3
+    assets, truncated = asyncio.run(api.list_assets(limit=1, max_pages=3))
+    assert len(calls) == 3, "the runaway guard must still stop the walk"
+    assert truncated is True, "stopping early while `next` remains must be reported"
+    assert len(assets) == 3
+
+
+def test_list_assets_reports_no_truncation_on_the_final_page(monkeypatch):
+    """Ending exactly on the page limit is not truncation if the server is done."""
+    import asyncio
+
+    api = JumpServerAPI(BastionConfig(url="https://x", private_token="TOK"))
+
+    async def fake_request(method, path, *, params=None, json_body=None):
+        offset = (params or {}).get("offset", 0)
+        if offset == 0:
+            return {"count": 2, "next": "https://x/p2", "results": [{"id": "a"}]}
+        return {"count": 2, "next": None, "results": [{"id": "b"}]}
+
+    monkeypatch.setattr(api, "request", fake_request)
+    assets, truncated = asyncio.run(api.list_assets(limit=1, max_pages=2))
+    assert [a["id"] for a in assets] == ["a", "b"]
+    assert truncated is False
 
 
 def test_api_does_not_export_the_json_module():

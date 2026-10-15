@@ -242,18 +242,29 @@ class JumpServerAPI:
     # --- discovery -------------------------------------------------------------
 
     async def list_assets(
-        self, *, search: str | None = None, limit: int = 200, max_pages: int = 10
-    ) -> list[dict]:
-        """Assets the current account is permitted to reach (the perm-scoped list).
+        self, *, search: str | None = None, limit: int = 200, max_pages: int = 100
+    ) -> tuple[list[dict], bool]:
+        """Assets this account may reach, plus whether the walk was cut short.
 
         Follows DRF pagination: a deployment with more than ``limit`` permitted assets
-        returns one page and a ``next`` link, and stopping at the first page silently
-        truncated the list — a fleet of 250 would show 200 with nothing to say so.
-        ``max_pages`` bounds the walk so a misreported ``next`` cannot loop forever.
+        returns one page and a ``next`` link, so stopping at the first page silently
+        truncated the list — a fleet of 250 showed 200 with nothing to say so.
+
+        Returns ``(assets, truncated)``. ``truncated`` is True **only** when the walk
+        stopped while the server was still offering a ``next`` page — i.e. the caller is
+        looking at a strict prefix and must be told so. Making it part of the return type
+        (rather than a log line) is the point: a partial inventory that reads as a complete
+        one is the exact failure this module exists to avoid, and a caller cannot ignore a
+        second return value.
+
+        ``max_pages`` is a runaway guard against a server that never stops offering
+        ``next``, not a limit on fleet size: at the defaults it allows 20 000 assets,
+        far above any real deployment.
         """
         out: list[dict] = []
+        truncated = False
         offset = 0
-        for _ in range(max(1, max_pages)):
+        for page_no in range(max(1, max_pages)):
             params: dict = {"limit": limit, "offset": offset}
             if search:
                 params["q"] = search
@@ -265,11 +276,14 @@ class JumpServerAPI:
                 break
             page = data.get("results", [])
             out.extend(page)
-            # No `next` (or a short/empty page) ends the walk.
+            # No `next` (or a short/empty page) ends the walk normally.
             if not data.get("next") or len(page) < limit:
                 break
             offset += limit
-        return out
+            if page_no == max(1, max_pages) - 1:
+                # Loop exhausted while `next` still offered more: the reply is a prefix.
+                truncated = True
+        return out, truncated
 
     async def get_asset(self, asset_id: str) -> dict:
         """One permitted asset, including its ``permed_accounts`` and protocols.

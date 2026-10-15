@@ -411,8 +411,9 @@ async def cmd_doctor(args: argparse.Namespace) -> int:
         print(f"  /api/health/ FAIL {exc}")
         ok = False
     try:
-        assets = await api.list_assets()
-        print(f"  assets       OK   {len(assets)} visible")
+        assets, truncated = await api.list_assets()
+        suffix = " (partial — the server had more pages)" if truncated else ""
+        print(f"  assets       OK   {len(assets)} visible{suffix}")
     except JumpServerError as exc:
         print(f"  assets       SKIP {exc} (run `jms-bridge login` to authenticate)")
     except Exception as exc:  # noqa: BLE001 - doctor must not crash on a bad API

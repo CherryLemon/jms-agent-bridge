@@ -309,7 +309,7 @@ async def jms_list_assets(search: str | None = None) -> dict:
     """
     api = _api()
     try:
-        assets = await api.list_assets(search=search)
+        assets, truncated = await api.list_assets(search=search)
     except JumpServerError as exc:
         return {"ok": False, "error": str(exc)}
     out = []
@@ -324,7 +324,17 @@ async def jms_list_assets(search: str | None = None) -> dict:
                 else a.get("platform"),
             }
         )
-    return {"ok": True, "count": len(out), "assets": out}
+    result: dict = {"ok": True, "count": len(out), "assets": out, "truncated": truncated}
+    if truncated:
+        # Never let a prefix read as the whole fleet. A *warning*, not an `error`: the call
+        # succeeded, and `error` is the key this surface reserves for a refusal — pairing it
+        # with `ok: true` would be self-contradictory and could trip a client that treats
+        # any `error` as failure.
+        result["warning"] = (
+            f"listing stopped after {len(out)} assets while the server still offered more: "
+            "this is a prefix, not the full inventory. Narrow it with `search`."
+        )
+    return result
 
 
 @_tool(read_only=True)
@@ -338,10 +348,11 @@ async def jms_asset_detail(asset_id: str, host_name: str | None = None) -> dict:
     REST request.
 
     Use the account this returns (``accounts[].username``, preferring an entry whose
-    ``secret_type`` is set) as ``account:`` in the host entry. `inventory_entry` is the
-    YAML block to paste under ``hosts:``; it leaves ``platform`` to you, because the
-    accelerator tag cannot be inferred from JumpServer's platform name and a wrong guess
-    probes with the wrong tool (see `jms_dev_discover` / the platform list in the README).
+    ``secret_type`` is set) as ``account:`` in the host entry. `inventory_yaml` is the
+    block to paste under ``hosts:``, and its ``platform`` is a **placeholder on purpose**:
+    the accelerator tag cannot be inferred from JumpServer's platform name, and a wrong
+    guess probes with the wrong tool and reports a healthy host with no accelerator (see
+    `jms_dev_discover` / the platform list in the README).
 
     Prefer this over a per-asset account *list* endpoint, which in practice is not
     exposed to a normal account (it answers 403); the detail call is.
@@ -393,13 +404,10 @@ async def jms_asset_detail(asset_id: str, host_name: str | None = None) -> dict:
             else asset.get("connectivity"),
         },
         "accounts": accounts,
-        "inventory_entry": {name: entry},
+        # One representation, not two: the YAML *is* the paste-ready form, and shipping the
+        # same content as a dict as well would double the payload for no gain (the mistake
+        # `jms_job_logs` was just fixed for). Callers that want a dict can parse this.
         "inventory_yaml": yaml.safe_dump({name: entry}, sort_keys=False),
-        "note": (
-            "platform is left blank on purpose: JumpServer's platform name does not say "
-            "which accelerator profile to probe, and guessing wrong silently reports a "
-            "healthy host with no accelerator. Set it from the host's chip."
-        ),
     }
 
 
