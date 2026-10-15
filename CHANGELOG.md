@@ -16,6 +16,30 @@
   entry's `env:` rather than exported. Verified end to end against dsh 0.2.0-rc.2: the
   server connects and all 24 tools register as `mcp__jms-bridge__*`.
 
+### Changed
+
+- **CI now covers Python 3.11 and 3.13, and lints `scripts/`.** The matrix was 3.10 and
+  3.12 only, so the one branch that legitimately differs by version — `config.py` using
+  stdlib `tomllib` from 3.11 and the `tomli` fallback on 3.10 — was the exact boundary
+  left untested, while `requires-python = ">=3.10"` advertises both ends. `scripts/` was
+  never linted despite being the acceptance pass's MCP client (`mcp_call.py`) and its
+  inventory builder (`verify_support.py`): a typo there breaks onboarding, not a test.
+- **Coverage is measured and gated.** `pytest` now reports coverage by default with a
+  floor (`[tool.coverage.report]` in `pyproject.toml`, a few points under the current
+  77% so ordinary churn does not trip it), and `pytest-cov` joined the `dev` extra. The
+  point is to fail a change that lands a large untested block — not to demand a number.
+
+### Fixed
+
+- **`doctor`'s data-plane handler caught `(InventoryError, Exception)`.** `InventoryError`
+  derives from `Exception`, so the first element was dead weight that read as though a
+  narrower case were handled separately. It is now `except Exception`, with the same
+  behaviour and an accurate comment.
+- **A README "24 tools" claim that nothing checked.** The count lived in prose while the
+  real surface was the set of `@_tool()` decorators, so adding a tool silently left the
+  doc wrong. A test now derives the count from the server's registry and compares it, and
+  the claim is verified to fail when the two drift.
+
 ## 0.2.2 — 2026-10-14
 
 ### Fixed

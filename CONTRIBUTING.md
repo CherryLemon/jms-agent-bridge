@@ -30,9 +30,14 @@ tests/           unit tests (no network)
 ```bash
 python -m venv .venv && . .venv/bin/activate
 pip install -e ".[dev]"
-ruff check src tests
+ruff check src tests scripts
 pytest -q
 ```
+
+`pytest` measures coverage by default and fails under the floor set in
+`pyproject.toml`'s `[tool.coverage.report]`; add `--no-cov` for a faster run when the
+number is not what you are looking at. `scripts/` is linted alongside `src` and `tests`
+because the onboarding pass drives the MCP tools through it.
 
 Integration is verified with `jms-bridge doctor` (read-only) against a real bastion,
 not from CI. CI runs lint + unit tests only.

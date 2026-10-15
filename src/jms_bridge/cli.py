@@ -433,7 +433,7 @@ async def cmd_doctor(args: argparse.Namespace) -> int:
             mark = "OK  " if reached else "FAIL"
             print(f"  {h.name:20} {mark} {res.stdout.strip() or res.stderr.strip()[:200]}")
             ok = ok and reached
-    except (InventoryError, Exception) as exc:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001 - doctor reports, never raises
         print(f"  data plane   FAIL {exc}")
         ok = False
     finally:

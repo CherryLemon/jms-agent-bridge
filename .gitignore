@@ -9,6 +9,10 @@ venv/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+# Written by the coverage run `pytest` now performs by default.
+.coverage
+.coverage.*
+htmlcov/
 .DS_Store
 
 # never commit local config or inventories (they hold hostnames + asset ids).

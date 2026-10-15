@@ -32,6 +32,7 @@ keyring = ["keyring>=24.0"]
 dev = [
     "pytest==9.1.1",
     "pytest-asyncio==1.4.0",
+    "pytest-cov==7.1.0",
     "ruff==0.15.12",
 ]
 
@@ -54,3 +55,20 @@ select = ["E", "F", "I", "UP", "B"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# Coverage is on by default so a local `pytest` reports what CI gates on; the
+# threshold lives in [tool.coverage.report] below.
+addopts = "--cov=jms_bridge --cov-report=term-missing"
+
+[tool.coverage.run]
+branch = true
+source = ["jms_bridge"]
+
+[tool.coverage.report]
+# A floor, not a goal: this is where the suite stands today (~77%), set a couple of
+# points low so ordinary churn does not trip it. It exists to fail a change that lands
+# a large block of untested code, not to demand a number.
+fail_under = 75
+show_missing = true
+# `__main__` is four lines reaching the CLI, exercised by subprocess in the stdio
+# tests rather than imported; counting it only dilutes the signal.
+omit = ["*/jms_bridge/__main__.py"]

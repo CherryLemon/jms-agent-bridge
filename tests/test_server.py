@@ -70,6 +70,31 @@ def test_mcp_server_lists_all_tools():
     assert info.server_info.version == __version__, "serverInfo.version must be the package's"
 
 
+def test_readme_tool_count_matches_the_registered_surface():
+    """The README's "N tools" claim is checked, not trusted.
+
+    The count is prose a person edits by hand, and adding a tool is exactly the change
+    that forgets it — the two lines are in different files and nothing else links them.
+    Deriving the real count from the server object (every ``@_tool()`` registers here)
+    and comparing it to the digit in the README makes the drift a test failure instead
+    of a stale doc.
+    """
+    import re
+    from pathlib import Path
+
+    readme = (Path(__file__).resolve().parent.parent / "README.md").read_text()
+    match = re.search(r"^(\d+) tools, grouped by what they act on", readme, re.MULTILINE)
+    assert match, "README no longer states the tool count in the expected form"
+
+    # The server's own registry is the source of truth: every ``@_tool()`` registers
+    # there, so this counts the surface a client would actually see.
+    registered = {t.name for t in asyncio.run(S.server.list_tools())}
+    assert len(registered) == int(match.group(1)), (
+        f"README says {match.group(1)} tools, the server registers {len(registered)}: "
+        f"{sorted(registered)}"
+    )
+
+
 # --- jms_dev_run unit coverage (fakes; no SSH, no hardware) -------------------------
 
 
