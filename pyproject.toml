@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "jms-agent-bridge"
 version = "0.2.2"
-description = "MCP bridge for JumpServer: drive heterogeneous GPU/NPU clusters from Claude Code over the audited bastion"
+description = "MCP bridge for JumpServer: drive heterogeneous GPU/NPU clusters from Claude Code, Codex or dsh over the audited bastion"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }

@@ -1,17 +1,17 @@
 # jms-agent-bridge
 
-**An MCP bridge that lets Claude Code and Codex drive a heterogeneous GPU/NPU cluster through a
-[JumpServer](https://github.com/jumpserver/jumpserver) bastion — without breaking the audit
-chain.**
+**An MCP bridge that lets Claude Code, Codex and DeepSeek Harness (dsh) drive a heterogeneous
+GPU/NPU cluster through a [JumpServer](https://github.com/jumpserver/jumpserver) bastion —
+without breaking the audit chain.**
 
 Point it at your bastion, describe your hosts once, and a single agent session can probe the
 cluster, push experiment code, launch a Torch-FL run across Ascend and CUDA nodes in parallel,
 watch it, and pull results back. Every byte still goes through JumpServer's audited SSH gateway.
 
 ```
-Claude Code / Codex ──stdio MCP──▶ jms-agent-bridge (local)
-                                     ├─ control plane: JumpServer REST API  (discovery · audit · tickets)
-                                     └─ data plane:    ssh/rsync via KoKo   (commands · sync · jobs)
+Claude Code / Codex / dsh ──stdio MCP──▶ jms-agent-bridge (local)
+                                          ├─ control plane: JumpServer REST API  (discovery · audit · tickets)
+                                          └─ data plane:    ssh/rsync via KoKo   (commands · sync · jobs)
 ```
 
 The bridge runs on **your** machine and is launched by your agent: nothing is installed on the
@@ -263,6 +263,59 @@ Codex has **no scope flag** — its `mcp add` is always global: it writes into C
 custom home the entry lands there instead, so trust `codex mcp list` over whatever file path you
 happen to open.
 
+### DeepSeek Harness (dsh)
+
+dsh has **no `mcp add` command**. Its official `@deepseek-ai/dsh-mcp-client` is already bundled
+with the `dsh` install, and an MCP server is registered by inserting one entry into a profile's
+patch layer — the same `cordis.patch.yml` dsh uses for models and plugins. Each profile
+(`~/.dsh/profiles/<name>/cordis.patch.yml`, e.g. `dsh-tui`, `headless`, `web`) has its own, so
+add the entry to every profile you want the cluster available in:
+
+```yaml
+- insert:
+    - id: mcp-jms-bridge
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        transport: stdio
+        serverName: jms-bridge
+        command: /abs/path/to/jms-agent-bridge/.venv/bin/jms-bridge
+        args: ['serve']
+        # jms_job_wait's own default is 150s; dsh caps a tool call at 60s unless raised.
+        toolCallTimeoutMs: 300000
+```
+
+Reload the profile (or restart dsh) and the bridge's tools arrive namespaced —
+`mcp__jms-bridge__jms_list_assets`, `mcp__jms-bridge__jms_dev_run`, and so on — so they sit
+alongside dsh's own tools rather than shadowing them. `/mcp` lists the server and its tool count.
+`examples/dsh-mcp.patch.yml` is the same entry with the commented secret list, ready to merge.
+
+Two details that are specific to dsh and will otherwise cost you an afternoon:
+
+- **Raise `toolCallTimeoutMs`; the default is 60 000 ms.** That is below `jms_job_wait`'s own
+  150-second default and well under the ~200s ceiling the long tools document, so a bounded wait
+  you asked for would be cut off by dsh first. `300000` (5 min) leaves the tool in charge.
+- **Secrets must be listed explicitly, because dsh scrubs the parent environment.** Names matching
+  `KEY|PASSWORD|SECRET|TOKEN` (case-insensitive) and any `DSH_*` are dropped before the child is
+  spawned — so `JMS_BRIDGE_SSH_PASSWORD`, `JMS_BRIDGE_PASSWORD`, `JMS_BRIDGE_SSH_KEY`,
+  `JMS_BRIDGE_ACCESS_KEY_ID`/`_SECRET`, `JMS_BRIDGE_PRIVATE_TOKEN` and `JMS_BRIDGE_SESSION_TOKEN`
+  never reach the server from a shell `export` the way they reach Claude Code or Codex. Put each
+  one under the entry's `env:`, taking the value from the environment so the secret stays out of
+  the file:
+
+  ```yaml
+        env:
+          JMS_BRIDGE_SSH_PASSWORD: !!js process.env.JMS_BRIDGE_SSH_PASSWORD
+          # ...and any other JMS_BRIDGE_* secret name you rely on
+  ```
+
+  Non-secret variables (`JMS_BRIDGE_URL`, `JMS_BRIDGE_CONFIG`, `JMS_BRIDGE_INVENTORY`,
+  `JMS_BRIDGE_SSH_PORT`, `JMS_BRIDGE_LOGIN_USER`, …) pass through untouched, and the recommended
+  path needs none of this: once `jms-bridge login` has cached a session token and `ssh_key` is
+  set, the entry above is complete as written.
+
+  A missing secret shows up the same way it does anywhere else — `jms_list_assets` refuses and
+  names the variable — rather than as a silent auth failure.
+
 ### Environment variables
 
 Nothing extra is needed once `jms-bridge login` has cached a session token and `ssh_key` is set.
@@ -274,16 +327,21 @@ claude mcp add --scope user jms-bridge -e JMS_BRIDGE_SSH_PASSWORD='...' -- /abs/
 codex mcp add jms-bridge --env JMS_BRIDGE_SSH_PASSWORD='...' -- /abs/path/to/.venv/bin/jms-bridge serve
 ```
 
+For dsh the equivalent is the `env:` block on the patch entry, not a flag — see
+[DeepSeek Harness (dsh)](#deepseek-harness-dsh) above.
+
 ### Verify
 
 ```bash
 claude mcp list          # → jms-bridge: … ✔ Connected
 codex mcp list           # → jms-bridge  …  enabled
+# dsh: /mcp from inside a session → jms-bridge with 24 tools
 ```
 
 `✔ Connected` / `enabled` means the agent started the server and completed the MCP handshake, so
 the tools are live. From an agent session, `jms_list_assets` is the quickest end-to-end proof —
 it goes out over the control plane and either returns your assets or tells you what is missing.
+In dsh, call it as `mcp__jms-bridge__jms_list_assets`.
 
 ### On a second machine
 

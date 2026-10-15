@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **DeepSeek Harness (dsh) is now a documented, verified MCP client.** The bridge already
+  spoke plain stdio MCP, so no code changed — what was missing was the registration path,
+  which is unlike Claude Code's and Codex's: dsh has no `mcp add` and registers a server by
+  inserting an `@deepseek-ai/dsh-mcp-client` entry into a profile's `cordis.patch.yml`, so
+  the README now shows that entry and `examples/dsh-mcp.patch.yml` is a copy-and-edit
+  version of it. Two dsh behaviours are called out because each fails quietly otherwise:
+  its 60-second default tool-call timeout sits below `jms_job_wait`'s own 150s default
+  (raise `toolCallTimeoutMs`), and it scrubs `KEY`/`PASSWORD`/`SECRET`/`TOKEN`-shaped names
+  from the parent environment, so every `JMS_BRIDGE_*` secret must be listed under the
+  entry's `env:` rather than exported. Verified end to end against dsh 0.2.0-rc.2: the
+  server connects and all 24 tools register as `mcp__jms-bridge__*`.
+
 ## 0.2.2 — 2026-10-14
 
 ### Fixed

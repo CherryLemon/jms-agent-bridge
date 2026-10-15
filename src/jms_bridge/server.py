@@ -1,6 +1,6 @@
-"""The MCP server: the tool surface Claude Code talks to.
+"""The MCP server: the tool surface the agent talks to.
 
-Runs as a local stdio process launched by Claude Code. Tools are grouped by plane:
+Runs as a local stdio process launched by Claude Code, Codex or dsh. Tools are grouped by plane:
 
 * control plane (:mod:`jms_bridge.api`) — ``jms_list_assets``, ``jms_audit_query``,
   ``jms_create_ticket``

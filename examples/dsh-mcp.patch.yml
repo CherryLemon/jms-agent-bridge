@@ -1,0 +1,41 @@
+# Register jms-agent-bridge with DeepSeek Harness (dsh).
+#
+# dsh has no `mcp add`; a server is one entry appended to a profile's patch layer.
+# Merge the block below into the `insert:` list of:
+#
+#     ~/.dsh/profiles/<profile>/cordis.patch.yml      # e.g. dsh-tui, headless, web
+#
+# and do it in every profile you want the cluster available in — the layers are
+# per-profile. Then restart dsh (or reload the profile) and check `/mcp`.
+#
+# Tools arrive namespaced: mcp__jms-bridge__jms_list_assets, mcp__jms-bridge__jms_dev_run, …
+#
+# Requires: `jms-bridge login` has cached a session token, and `ssh_key` is set.
+# Absolute path on `command`, because dsh launches the server without your shell.
+
+- insert:
+    - id: mcp-jms-bridge
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        transport: stdio
+        serverName: jms-bridge
+        command: /abs/path/to/jms-agent-bridge/.venv/bin/jms-bridge
+        args: ['serve']
+        # dsh defaults to 60000ms, which is below jms_job_wait's own 150s default
+        # and the ~200s ceiling the long tools document — raise it or the wait you
+        # asked for is cut off by the harness first.
+        toolCallTimeoutMs: 300000
+        # dsh scrubs KEY/PASSWORD/SECRET/TOKEN (and DSH_*) names from the parent
+        # environment, so any JMS_BRIDGE_* secret must be listed here explicitly.
+        # `!!js` reads it from your environment at boot, keeping it out of this file.
+        # Drop the whole block on the key path (session token + ssh_key), which
+        # needs no secret here at all.
+        env:
+          # JMS_BRIDGE_SSH_PASSWORD: !!js process.env.JMS_BRIDGE_SSH_PASSWORD
+          # JMS_BRIDGE_ACCESS_KEY_ID: !!js process.env.JMS_BRIDGE_ACCESS_KEY_ID
+          # JMS_BRIDGE_ACCESS_KEY_SECRET: !!js process.env.JMS_BRIDGE_ACCESS_KEY_SECRET
+          # JMS_BRIDGE_PRIVATE_TOKEN: !!js process.env.JMS_BRIDGE_PRIVATE_TOKEN
+          # JMS_BRIDGE_SESSION_TOKEN: !!js process.env.JMS_BRIDGE_SESSION_TOKEN
+          # JMS_BRIDGE_SSH_KEY: !!js process.env.JMS_BRIDGE_SSH_KEY
+          # Non-secret names pass through untouched (JMS_BRIDGE_URL, JMS_BRIDGE_CONFIG,
+          # JMS_BRIDGE_INVENTORY, JMS_BRIDGE_SSH_PORT, JMS_BRIDGE_LOGIN_USER, …).
