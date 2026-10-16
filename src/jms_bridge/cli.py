@@ -11,10 +11,13 @@ import argparse
 import asyncio
 import dataclasses
 import getpass
+import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import httpx
@@ -130,6 +133,46 @@ def _inventory_path() -> Path:
     return inventory_path()
 
 
+def _set_bastion_value(path: Path, key: str, value: str) -> Path:
+    """Set ``key = "value"`` inside the ``[bastion]`` table, in place, with a backup.
+
+    Line-oriented rather than a TOML round-trip on purpose: rewriting the file wholesale
+    would discard the user's comments and key order, and ``config.toml`` is a file the
+    README tells people to hand-edit. An existing (possibly commented-out) assignment is
+    replaced, otherwise the line is inserted right after the ``[bastion]`` header so it
+    lands in the right table.
+
+    ``value`` is TOML-escaped with :func:`json.dumps`: JSON string escaping is a subset
+    of TOML basic-string escaping, which is the same trick :mod:`jms_bridge.secrets`
+    uses for the credentials file — a password containing a quote or a backslash must not
+    produce a config that :func:`~jms_bridge.config.read_toml` then refuses to parse.
+    The substitution takes a *callable* replacement for the same reason: in a string
+    replacement ``re.sub`` reads ``\\`` and ``\1`` out of the escaped value as escapes of
+    its own, which silently unescapes the password and corrupts the file.
+
+    The backup exists because this rewrites the very file the data plane authenticates
+    with: if the new value turns out to be wrong, the previous one is still on disk.
+    """
+    text = path.read_text()
+    line = f"{key} = {json.dumps(value)}"
+    assignment = re.compile(rf"(?m)^\s*{re.escape(key)}\s*=.*$")
+    if assignment.search(text):
+        text = assignment.sub(lambda _m: line, text)
+    elif "[bastion]" in text:
+        text = text.replace("[bastion]", f"[bastion]\n{line}", 1)
+    else:
+        text += f"\n[bastion]\n{line}\n"
+
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    backup = path.with_suffix(path.suffix + f".bak.{stamp}")
+    shutil.copy2(path, backup)
+    # Preserve the original mode: the file holds the session token, and rewriting it
+    # must not be the step that widens it.
+    path.write_text(text)
+    os.chmod(path, path.stat().st_mode & 0o777)
+    return backup
+
+
 def cmd_init(args: argparse.Namespace) -> int:
     cfg_path, inv_path = _config_path(), _inventory_path()
     cfg_path.parent.mkdir(parents=True, exist_ok=True)
@@ -178,9 +221,13 @@ async def cmd_login(args: argparse.Namespace) -> int:
     The password is read from ``--password``, then ``JMS_BRIDGE_PASSWORD``, then a
     previously saved copy (keyring, else the 0600 credentials file), and only then
     prompted for. ``--save-password`` stores it for next time; ``--forget`` deletes it.
-    """
-    import re
 
+    Note which plane each secret feeds. The password here is the *control plane* one the
+    REST API accepts; the *data plane* (KoKo SSH) reads ``bastion.ssh_password`` from the
+    config file, a separate field this command deliberately does not touch. When the two
+    are the same secret — the common case — ``--sync-ssh-password`` copies it across, so
+    changing the password does not leave the SSH half authenticating with the old one.
+    """
     if getattr(args, "forget", False):
         cleared = secrets.forget_password()
         print(
@@ -190,6 +237,7 @@ async def cmd_login(args: argparse.Namespace) -> int:
         )
         return 0
 
+    sync_ssh = getattr(args, "sync_ssh_password", False)
     cfg = load_config()
     username = args.username or cfg.login_user
     password = args.password or secrets.get_password()
@@ -227,8 +275,11 @@ async def cmd_login(args: argparse.Namespace) -> int:
         return 2
     text = path.read_text()
     line = f'session_token = "{token}"'
-    if re.search(r"(?m)^\s*session_token\s*=", text):
-        text = re.sub(r"(?m)^\s*session_token\s*=.*$", line, text)
+    token_assignment = re.compile(r"(?m)^\s*session_token\s*=.*$")
+    if token_assignment.search(text):
+        # Callable replacement, not the string form: a token containing a backslash would
+        # otherwise be read as an escape sequence by `re.sub` and written out corrupted.
+        text = token_assignment.sub(lambda _m: line, text)
     elif "[bastion]" in text:
         text = text.replace("[bastion]", f"[bastion]\n{line}", 1)
     else:
@@ -238,6 +289,30 @@ async def cmd_login(args: argparse.Namespace) -> int:
     print(f"logged in as {username}; token cached in {path} (mode 600)")
     if getattr(args, "save_password", False):
         print(f"saved the password to {secrets.save_password(password)}")
+
+    if sync_ssh:
+        # Order matters: this runs *after* the control-plane login succeeded, so a
+        # mistyped password never overwrites a working data-plane credential.
+        if cfg.ssh_password == password:
+            print("data plane        ssh_password already matches; nothing to change")
+        else:
+            backup = _set_bastion_value(path, "ssh_password", password)
+            was = "replaced" if cfg.ssh_password else "set (was unset)"
+            print(f"data plane        ssh_password {was} in {path}")
+            print(f"                  backup: {backup}")
+            if os.environ.get("JMS_BRIDGE_SSH_PASSWORD"):
+                print(
+                    "                  note: JMS_BRIDGE_SSH_PASSWORD is exported and "
+                    "still overrides this value"
+                )
+    elif cfg.ssh_password and cfg.ssh_password != password:
+        # Silent drift here is the failure this whole flag exists for: the control plane
+        # works and every SSH tool fails with an auth error that names neither file.
+        print(
+            f"note: the data plane still uses a different password "
+            f"(bastion.ssh_password in {path}); re-run with --sync-ssh-password to "
+            f"copy this one across, or set JMS_BRIDGE_SSH_PASSWORD."
+        )
     return 0
 
 
@@ -496,6 +571,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_login.add_argument(
         "--forget", action="store_true", help="delete the saved password and exit"
+    )
+    p_login.add_argument(
+        "--sync-ssh-password",
+        action="store_true",
+        help=(
+            "also write this password to bastion.ssh_password in the config (the KoKo "
+            "data plane reads that field, not the saved one); backs the file up first"
+        ),
     )
     p_login.set_defaults(func=lambda a: asyncio.run(cmd_login(a)))
 
