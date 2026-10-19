@@ -21,6 +21,7 @@ import hashlib
 import os
 import shlex
 import shutil
+import signal
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -53,22 +54,46 @@ def _require_tool(binary: str, hint: str) -> None:
 
 
 async def _kill(proc: asyncio.subprocess.Process) -> None:
-    """Terminate a spawned ssh/rsync and reap it, whatever ended the wait.
+    """Terminate a spawned ssh/rsync **and its process group**, then reap it.
 
     Called under ``except BaseException`` — which includes ``asyncio.CancelledError`` — so
     a cancelled tool call (the client disconnecting, the gateway cutting a long response
     off) does not leave the child running. Catching only ``TimeoutError`` leaked one ssh
     process per cancelled call: ``CancelledError`` is a ``BaseException``, so it skipped
-    the kill entirely. The process would go on holding the ControlMaster socket and,
-    for a job launch, the remote work it was asked to start. ``wait()`` is itself
-    shielded from a second cancellation by re-raising only after the child is reaped.
+    the kill entirely. ``wait()`` is itself shielded from a second cancellation by
+    re-raising only after the child is reaped.
+
+    The *group* matters, not just the child: password auth spawns ``sshpass`` which in
+    turn spawns ``ssh``, so ``proc.kill()`` alone left the real ssh running — and a
+    surviving ssh keeps the ControlMaster socket alive for ``ControlPersist`` seconds.
+    The next call then reuses a half-dead multiplexed channel, which is how a 2s timeout
+    turned into a 10s call returning **exit 0 with a DNS error on stdout** (see
+    :meth:`SSHRunner._run_script`). Every child is spawned with ``start_new_session=True``
+    precisely so this group kill is the whole tree.
     """
     if proc.returncode is not None:
         return
     try:
-        proc.kill()
-    except ProcessLookupError:  # already gone between the check and the kill
-        return
+        pgid = os.getpgid(proc.pid)
+    except ProcessLookupError:
+        return  # already gone between the check and the lookup
+    # Never signal our *own* group: that would take down the MCP server (and, in tests,
+    # pytest itself). A child spawned without `start_new_session` shares our group, so
+    # this is a real hazard, not just a test artifact — `killpg(getpgid(self))` is a
+    # process-suicide button. Fall back to signalling the child alone in that case.
+    if pgid == os.getpgid(0):
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            return
+    else:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                return
     try:
         await proc.wait()
     except asyncio.CancelledError:  # pragma: no cover - second cancel during reaping
@@ -290,6 +315,10 @@ class SSHRunner:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=self._subproc_env(host),
+                # Own session => own process group, so `_kill` can take down sshpass
+                # *and* the ssh it spawned in one signal. Without this the `sshpass -e
+                # ssh ...` chain outlives a `proc.kill()` on the group leader.
+                start_new_session=True,
             )
             try:
                 out, err = await asyncio.wait_for(
@@ -303,6 +332,12 @@ class SSHRunner:
                 )
             except (TimeoutError, asyncio.TimeoutError):
                 await _kill(proc)
+                # The ssh that owns this host's ControlMaster is gone, but the *master*
+                # (a forked background process, not our child) outlives it for
+                # ControlPersist=300s and keeps the socket open. Reusing that channel is
+                # the documented way a short timeout produces a long, wrongly-successful
+                # call, so tear it down before anyone can reuse it.
+                await self._close_control_master(host)
                 return ExecResult(
                     host=host.name,
                     exit_code=124,
@@ -315,6 +350,7 @@ class SSHRunner:
                 # cancelled call leaves the ssh process running. Re-raised so the caller
                 # sees the original failure, not a masked one.
                 await _kill(proc)
+                await self._close_control_master(host)
                 raise
 
     async def exec_on(
@@ -426,6 +462,45 @@ class SSHRunner:
                 out.decode(errors="replace"),
                 err.decode(errors="replace"),
             )
+
+    async def _close_control_master(self, host: Host) -> None:
+        """Ask the ControlMaster for *host* to exit, then drop its socket.
+
+        Best effort by design: it runs on the timeout and cancellation paths, where the
+        ssh is already dead and a failure to clean up must not replace the real result
+        with a cleanup error. ``-O exit`` talks to the existing socket, so it needs no
+        authentication — hence no ``SSHPASS``.
+
+        ``-o ControlMaster=no`` is essential: without it this invocation would try to
+        *become* a master for the same ControlPath and could re-create the socket we are
+        trying to remove.
+        """
+        sock = self._sock(host)
+        if not sock.exists():
+            return
+        try:
+            p = await asyncio.create_subprocess_exec(
+                "ssh",
+                "-o",
+                f"ControlPath={sock}",
+                "-o",
+                "ControlMaster=no",
+                "-o",
+                "BatchMode=yes",
+                "-O",
+                "exit",
+                self.target(host),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                env=self._subproc_env(),
+                start_new_session=True,
+            )
+            # Bounded: a wedged master would otherwise hang the cleanup of the very call
+            # that already timed out.
+            await asyncio.wait_for(p.wait(), timeout=5)
+        except Exception:  # pragma: no cover - best-effort cleanup
+            pass
+        sock.unlink(missing_ok=True)
 
     async def close(self) -> None:
         """Tear down multiplexed connections (call on shutdown)."""

@@ -1,4 +1,5 @@
 import asyncio
+import os
 
 import pytest
 
@@ -197,7 +198,8 @@ class _ChildTracker:
 
     async def spawn(self, real_exec):
         proc = await real_exec(
-            "sleep", "300",
+            "sleep",
+            "300",
             # `stdin=PIPE` matters: `_run_script` calls `communicate(script)`, and on
             # Python 3.10/3.11 that raises AttributeError when stdin is None (3.12+
             # tolerates it). The fake must mirror the real spawn's shape, or the test
@@ -274,3 +276,145 @@ def test_kill_helper_ignores_an_already_dead_process():
         await _kill(proc)  # must not raise ProcessLookupError
 
     asyncio.run(main())
+
+
+def test_run_script_spawns_in_its_own_session(monkeypatch):
+    """The child must lead its own process group, or `_kill` cannot take down the tree.
+
+    `sshpass -e ssh ...` is two processes. Killing only the group leader leaves the real
+    ssh running; a surviving ssh keeps the ControlMaster socket alive for ControlPersist
+    seconds, and the next call then reuses a half-dead channel — observed as a 2s timeout
+    becoming a 10s call that returned exit 0 with a DNS error on stdout.
+    """
+    r = make_runner()
+    tracker = _ChildTracker()
+    seen = {}
+
+    async def fake_exec(*argv, **kw):
+        seen.update(kw)
+        return await tracker.spawn(_REAL_EXEC)
+
+    monkeypatch.setattr("jms_bridge.ssh.asyncio.create_subprocess_exec", fake_exec)
+    monkeypatch.setattr("jms_bridge.ssh.shutil.which", lambda name, *a, **k: "/usr/bin/" + name)
+
+    h = Host(name="a", login="u", asset_id="A")
+
+    async def main():
+        # The fake child is `sleep 300`, so cancel rather than wait out a real timeout.
+        task = asyncio.create_task(r._run_script(h, "echo hi", 600))
+        await asyncio.sleep(0.2)  # let the spawn happen
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(main())
+    assert seen.get("start_new_session") is True
+
+
+def test_kill_takes_down_the_whole_process_group(monkeypatch):
+    """A grandchild (sshpass -> ssh) must die with its leader.
+
+    Signals the *real* group here, unlike the tracker-based tests, because the point is
+    that the group is killed rather than only the leader.
+    """
+    from jms_bridge.ssh import _kill
+
+    async def main():
+        proc = await asyncio.create_subprocess_exec(
+            "sh",
+            "-c",
+            "sleep 300 & sleep 300",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+        await asyncio.sleep(0.3)
+        pgid = os.getpgid(proc.pid)
+        assert pgid != os.getpgid(0), "child must not share the test runner's group"
+
+        await _kill(proc)
+        assert proc.returncode is not None
+
+        # The whole group is gone, so signal 0 on it raises ESRCH.
+        with pytest.raises(ProcessLookupError):
+            os.killpg(pgid, 0)
+
+    asyncio.run(main())
+
+
+def test_kill_refuses_to_signal_its_own_process_group(monkeypatch):
+    """`killpg` on our own group would take down the MCP server (or pytest)."""
+    from jms_bridge.ssh import _kill
+
+    killed = {}
+
+    async def fake_exec(*argv, **kw):
+        # Deliberately *without* start_new_session: the child shares our group.
+        return await _REAL_EXEC(
+            "sleep",
+            "300",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+    async def main():
+        proc = await fake_exec()
+        await asyncio.sleep(0.1)
+        assert os.getpgid(proc.pid) == os.getpgid(0)
+
+        real_killpg = os.killpg
+
+        def spy_killpg(pgid, sig):
+            killed["pgid"] = pgid
+            return real_killpg(pgid, sig)
+
+        monkeypatch.setattr("jms_bridge.ssh.os.killpg", spy_killpg)
+        await _kill(proc)
+        # The group was never signalled, and the child is still reaped.
+        assert "pgid" not in killed
+        assert proc.returncode is not None
+
+    asyncio.run(main())
+
+
+def test_a_timeout_closes_the_hosts_control_master(monkeypatch):
+    """A timed-out call must not leave a reusable ControlMaster behind.
+
+    Without this, the surviving master answers the next call on a half-dead channel,
+    yielding exit 0 with a transport error on stdout — a false green.
+    """
+    r = make_runner()
+    tracker = _ChildTracker()
+    _patch_spawn(monkeypatch, tracker)
+
+    closed = []
+
+    async def fake_close(host):
+        closed.append(host.name)
+
+    monkeypatch.setattr(r, "_close_control_master", fake_close)
+
+    h = Host(name="a", login="u", asset_id="A")
+    res = asyncio.run(r._run_script(h, "echo hi", 0.2))
+    assert res.timed_out is True
+    assert closed == ["a"], "timeout must tear the ControlMaster down"
+
+
+def test_close_control_master_is_a_noop_without_a_socket(monkeypatch, tmp_path):
+    """No socket means no master to talk to; the helper must not spawn or raise."""
+    from jms_bridge.ssh import SSHRunner
+
+    r = make_runner()
+    h = Host(name="never-connected", login="u", asset_id="A")
+    spawned = []
+
+    async def fake_exec(*argv, **kw):
+        spawned.append(argv)
+        raise AssertionError("must not spawn without a socket")
+
+    monkeypatch.setattr("jms_bridge.ssh.asyncio.create_subprocess_exec", fake_exec)
+    asyncio.run(r._close_control_master(h))
+    assert spawned == []
+    assert isinstance(r, SSHRunner)
