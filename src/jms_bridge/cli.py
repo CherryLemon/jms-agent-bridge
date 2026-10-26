@@ -604,7 +604,12 @@ def main(argv: list[str] | None = None) -> int:
     p_probe.set_defaults(func=lambda a: asyncio.run(cmd_probe(a)))
 
     p_serve = sub.add_parser("serve", help="run the MCP server on stdio")
-    p_serve.set_defaults(func=lambda a: _serve())
+    p_serve.add_argument(
+        "--compact", action="store_true", help="four tools, REST inventory, native SSH"
+    )
+    p_serve.add_argument("--transport", choices=["stdio", "streamable-http"], default="stdio")
+    p_serve.add_argument("--port", type=int, default=8766, help="compact HTTP loopback port")
+    p_serve.set_defaults(func=lambda a: _serve(a.compact, a.transport, a.port))
 
     args = parser.parse_args(argv)
     try:
@@ -618,7 +623,18 @@ async def _sync(fn, args):  # noqa: ANN001 - adapts a sync command to the async 
     return fn(args)
 
 
-def _serve() -> int:
+def _serve(compact: bool = False, transport: str = "stdio", port: int = 8766) -> int:
+    if not 1 <= port <= 65535:
+        raise ConfigError("port must be 1..65535")
+    if compact:
+        try:
+            from .compact import main as compact_main
+        except ImportError as exc:
+            raise ConfigError('compact mode needs pip install "jms-agent-bridge[compact]"') from exc
+        compact_main(transport=transport, port=port)
+        return 0
+    if transport != "stdio":
+        raise ConfigError("streamable-http requires --compact")
     from .server import main as serve_main
 
     serve_main()

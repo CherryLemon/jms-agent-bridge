@@ -1,0 +1,16 @@
+[Unit]
+Description=JumpServer compact MCP bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Replace this executable path if installed in a different virtual environment.
+ExecStart=%h/.local/bin/jms-bridge serve --compact --transport streamable-http --port 8766
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+UMask=0077
+
+[Install]
+WantedBy=default.target

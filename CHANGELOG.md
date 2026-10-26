@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add opt-in compact MCP serving with four tools, durable bounded-output reads,
+  REST inventory refresh, native SSH connection/session ownership, remote Docker,
+  and rsync over the pooled connection. Existing serving behavior remains the default.
+
 ### Added
 
 - **`jms_asset_detail` — one asset's accounts, and a paste-ready `hosts.yaml` entry.**
