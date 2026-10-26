@@ -17,6 +17,15 @@ Claude Code / Codex / dsh ──stdio MCP──▶ jms-agent-bridge (local)
 The bridge runs on **your** machine and is launched by your agent: nothing is installed on the
 bastion, and your credentials stay in your own key agent and config file.
 
+## Compact resident mode
+
+An optional [four-tool resident service](docs/compact-service.md) provides
+`run`, `read_result`, `discover`, and `call`, complete output files, native SSH
+connection reuse with explicit persistent shells, remote Docker, and hourly REST
+asset discovery. Install `pip install "jms-agent-bridge[compact]"` and run
+`jms-bridge serve --compact --transport streamable-http`. The existing tool surface
+and YAML workflow remain the default.
+
 ## Requirements
 
 - **Python 3.10+**

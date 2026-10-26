@@ -23,6 +23,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Native connections and validation for the optional four-tool resident service.
+compact = ["asyncssh>=2.24,<3", "jsonschema>=4.20,<5", "uvicorn>=0.30,<1"]
 # Optional: keep a saved JumpServer password in the OS keyring rather than a 0600 file.
 # Deliberately an extra — a hard dependency would change the clone-and-run install for
 # everyone to spare `login --save-password` a plaintext fallback it already handles.
@@ -34,6 +36,8 @@ dev = [
     "pytest-asyncio==1.4.0",
     "pytest-cov==7.1.0",
     "ruff==0.15.12",
+    "asyncssh==2.24.1",
+    "jsonschema==4.26.0",
 ]
 
 [project.scripts]

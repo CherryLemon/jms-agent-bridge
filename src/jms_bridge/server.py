@@ -21,6 +21,7 @@ import os
 import re
 import subprocess
 from collections.abc import Callable
+from contextvars import ContextVar
 from typing import Any, TypedDict, TypeVar
 
 import yaml
@@ -241,20 +242,29 @@ async def _progress(ctx: Context | None, done: float, total: float, message: str
 
 _state: dict[str, Any] = {}
 
+# Per-call dependencies for optional facades; the legacy server keeps its lazy state.
+_runtime: ContextVar[dict[str, Any] | None] = ContextVar("jms_runtime", default=None)
+
 
 def _cfg() -> BastionConfig:
+    if runtime := _runtime.get():
+        return runtime["cfg"]
     if "cfg" not in _state:
         _state["cfg"] = load_config()
     return _state["cfg"]
 
 
 def _inv() -> Inventory:
+    if runtime := _runtime.get():
+        return runtime["inv"]
     if "inv" not in _state:
         _state["inv"] = Inventory.load()
     return _state["inv"]
 
 
 def _ssh() -> SSHRunner:
+    if runtime := _runtime.get():
+        return runtime["ssh"]
     if "ssh" not in _state:
         cfg = _cfg()
         _state["ssh"] = SSHRunner(cfg, max_parallel=cfg.max_parallel)
@@ -262,12 +272,16 @@ def _ssh() -> SSHRunner:
 
 
 def _jobs() -> JobManager:
+    if runtime := _runtime.get():
+        return runtime["jobs"]
     if "jobs" not in _state:
         _state["jobs"] = JobManager(_ssh())
     return _state["jobs"]
 
 
 def _api() -> JumpServerAPI:
+    if runtime := _runtime.get():
+        return runtime["api"]
     if "api" not in _state:
         _state["api"] = JumpServerAPI(_cfg())
     return _state["api"]
@@ -520,6 +534,8 @@ _MIN_PER_HOST = 2_000
 
 def _fanout_reply(results: list[ExecResult]) -> list[dict]:
     """Per-host reply entries, sharing one aggregate output budget across the fleet."""
+    if runtime := _runtime.get():
+        return runtime["fanout_reply"](results)
     budget = _per_host_output_budget(len(results))
     return [r.to_dict(limit=budget) for r in results]
 

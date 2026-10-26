@@ -12,6 +12,10 @@ src/jms_bridge/
   api.py         JumpServer REST control plane (auth, discovery, audit, tickets)
   server.py      the MCP tool surface
   cli.py         init / doctor / probe / serve
+  compact.py     opt-in four-tool facade with per-call legacy operation dependencies
+  native_ssh.py  process-owned SSH connections and explicit persistent shells
+  rest_inventory.py  atomic REST snapshots with background refresh
+  results.py     private output files, previews, and bounded reads
 tests/           unit tests (no network)
 ```
 

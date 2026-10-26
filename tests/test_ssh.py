@@ -53,7 +53,9 @@ def test_controlmaster_is_enabled_for_reuse():
     assert "ControlPersist=300" in joined
 
 
-def test_bastion_password_uses_sshpass_and_forces_password_auth():
+def test_bastion_password_uses_sshpass_and_forces_password_auth(monkeypatch):
+    # This tests argv construction, not the workstation's installed binaries.
+    monkeypatch.setattr("jms_bridge.ssh.shutil.which", lambda name: f"/usr/bin/{name}")
     r = make_runner(ssh_password="s3cret")
     h = Host(name="a", login="u", asset_id="A")
     argv = r._ssh_argv(h)
