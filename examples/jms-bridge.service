@@ -9,7 +9,7 @@ Type=simple
 ExecStart=%h/.local/bin/jms-bridge serve --compact --transport streamable-http --port 8766
 Restart=on-failure
 RestartSec=5
-TimeoutStopSec=15
+TimeoutStopSec=20min
 UMask=0077
 
 [Install]

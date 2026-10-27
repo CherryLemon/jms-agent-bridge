@@ -266,3 +266,34 @@ reserve. The collector needs Python 3.9+ on the target. Parser attribution and
 license are in `src/jms_bridge/inspection_vendor/`; tests use sanitized samples.
 
 See [structured filesystem operations](filesystem.md) for action options, paging, transfer semantics and automatic channel reuse. When the client and target share storage, prefer a verified local/remote path mapping over redundant transfers; mappings must be supplied by the deployment.
+
+## Compact responses and timing
+
+The five top-level tools emit minified JSON text while preserving the structured
+content, error behavior, metadata and whitespace inside string values. Full saved
+files and byte offsets are unchanged. Shared initialization instructions carry
+only cross-tool rules; usage details live in the relevant tool description and
+discovered operation schema. Clients should parse JSON rather than depend on
+presentation indentation. Schemas are still published with the same input shapes.
+
+Validators for trusted generated operation schemas are compiled once per service;
+validation still reports the same best-match argument error. The `jms_fs` alias
+avoids redoing complete schema validation while retaining action-specific checks.
+
+`tool_finished` log events contain tool/operation name, handler duration, response
+bytes, storage wait, storage operation count and JSON compaction duration. Handler
+timing excludes the outer HTTP/client/agent path. Storage wait sums concurrent
+child operations and can exceed wall time. Logs contain no scripts, file contents
+or credentials. Connection timing splits login queue, existing pacing, handshake
+and authentication; no login policy change is introduced.
+
+Read-only filesystem probes reuse bounded private shell channels, with a fresh
+Python probe for every request. File contents are not cached, and ordinary `run`
+keeps its isolated-shell default. Cold connection setup and pool saturation still
+have higher latency; `read_many` and verified shared local storage avoid needless
+round trips. Measure warm and cold distributions separately.
+
+A client-side transport disconnect or temporarily missing tool schema does not
+establish that remote work failed. Reconnect and refresh tool discovery; retry
+read-only checks with bounded backoff. Reconcile mutations using the original
+request ID before considering any new submission.
