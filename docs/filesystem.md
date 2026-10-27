@@ -18,7 +18,7 @@ It does not change authorization scope or bypass a client/JumpServer denial.
 
 Every request needs `target` (one exact REST asset) and `action`. Supply an absolute
 remote `path`, or `paths` for `read_many`. Optional `container` selects an existing
-Docker container. The target/container needs Python 3.9+; no package installation
+Docker container. The target/container needs Python 3.8+; no package installation
 or GPU initialization occurs. No shell expansion (`~`, `$VAR`) is performed.
 
 | Action | Use | Main options |
