@@ -1,10 +1,10 @@
 """Structured, read-only remote exploration over the resident SSH runner."""
 
-import json
 import re
 from pathlib import Path
 
 from .async_io import offload
+from .bash_fs import WIRE_LIMIT, decode, remote_script
 from .fs_workers import FilesystemWorkers
 
 OPERATION = "jms_fs"
@@ -20,6 +20,11 @@ ACTIONS = [
     "upload",
     "download",
 ]
+
+
+def diagnostic_prefix(path):
+    with path.open("rb") as stream:
+        return stream.read(2048)
 
 
 def integer(low, high, default, description):
@@ -114,7 +119,8 @@ SCHEMA = {
                 "type": "boolean",
                 "default": True,
                 "description": (
-                    "search: false enables regex (ripgrep syntax, or Python re when rg is absent)."
+                    "search: false enables regex (ripgrep syntax, or GNU grep POSIX ERE "
+                    "when rg is absent)."
                 ),
             },
             "case_sensitive": {"type": "boolean", "default": True},
@@ -142,7 +148,7 @@ SCHEMA = {
                 "type": "boolean",
                 "default": True,
                 "description": (
-                    "glob/search: rg respects .gitignore/.ignore. Python "
+                    "glob/search: rg respects .gitignore/.ignore. Bash "
                     "fallback reports ignore rules unavailable."
                 ),
             },
@@ -274,18 +280,6 @@ def validate(arguments):
         )
 
 
-def remote_script(options):
-    source = Path(__file__).with_name("fs_probe.py").read_text()
-    # Fixed code, JSON data; user paths/patterns are never shell syntax or eval input.
-    return (
-        "python3 -I -S - <<'__JMS_FS_PY__'\n"
-        + source
-        + "\nmain(json.loads("
-        + repr(json.dumps(options))
-        + "))\n__JMS_FS_PY__\n"
-    )
-
-
 class Filesystem:
     def __init__(self, catalog, runner, store):
         self.catalog, self.runner, self.store = catalog, runner, store
@@ -361,12 +355,14 @@ class Filesystem:
                     "warning",
                 )
             } | await offload(self.store.preview, rid, 2048)
-        raw = await offload(self.store.path(rid, "stdout").read_bytes)
+        path = self.store.path(rid, "stdout")
+        if (await offload(path.stat)).st_size > WIRE_LIMIT * 2 + 65536:
+            return dict(ok=False, result_id=rid, error="filesystem probe exceeded wire limit")
+        raw = await offload(path.read_bytes)
         try:
-            value = json.loads(raw)
-            if not isinstance(value, dict):
-                raise ValueError("not an object")
-        except (ValueError, UnicodeError):
+            stderr = await offload(diagnostic_prefix, self.store.path(rid, "stderr"))
+            value = decode(raw, options, stderr)
+        except (ValueError, UnicodeError, KeyError, TypeError, OverflowError):
             return dict(
                 ok=False,
                 result_id=rid,
