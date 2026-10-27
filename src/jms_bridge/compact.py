@@ -1,24 +1,29 @@
 """Four-tool MCP facade with progressive disclosure and REST-backed targets."""
 
 import asyncio
+import contextvars
 import json
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
+from pydantic import Field
 
 from . import __version__
 from . import server as upstream
+from .async_io import offload
+from .comment_guard import check as check_script_guard
 from .config import ConfigError, load_config
 from .inventory import InventoryError
-from .jobs import JobManager
 from .native_ssh import NativeSSHRunner
+from .recoverable_jobs import RecoverableJobManager
+from .request_journal import RequestJournal
 from .rest_inventory import AssetCatalog
-from .results import ResultStore
+from .results import ResultStore, preview_buffers
 from .runtime_config import StateLock, load_settings
 
 CATEGORIES = {
@@ -42,8 +47,20 @@ CATEGORIES = {
     "development": ["jms_dev_sync", "jms_dev_run", "jms_dev_logs", "jms_dev_discover"],
     "audit": ["jms_audit_query", "jms_create_ticket"],
     "sessions": ["session_list", "session_close"],
+    "requests": ["request_status"],
+    "guard": ["script_guard_check"],
 }
+DANGEROUS_FLAG_DESCRIPTION = (
+    "Acknowledge the bridge's local destructive-pattern guard for this specific, already "
+    "user-authorized command (default false). This flag does not grant authorization, request "
+    "or record approval, or override Codex automatic review, OS permissions, or JumpServer "
+    "policy. Do not use it to retry an external approval denial."
+)
 INSTRUCTIONS = """JumpServer access through four tools.
+After a lost reply, query request_status with the original request_id; never blindly replay.
+Saved outputs expire after a configurable TTL (default 7 days); receipts remain for deduplication.
+allow_dangerous acknowledges only the local pattern guard for an already-authorized command;
+it grants no approval and cannot override client, OS or JumpServer denial.
 Use run for literal Bash or a local script_path;
 container/image selects remote Docker without nested shell quoting. SSH connections belong to this
 service. Each run is isolated unless session_id is explicitly supplied. The same session_id on the
@@ -75,23 +92,36 @@ def unwrap(result):
     return {"content": blocks, "ok": not result.is_error}
 
 
+def script_is_dangerous(script):
+    return check_script_guard(script, upstream._DANGEROUS_PATTERNS)["blocked"]
+
+
 class BridgeService:
     def __init__(self, cfg=None, settings=None):
         self.cfg = cfg or load_config()
         self.settings = settings or load_settings()
-        self.store = ResultStore(self.settings.state_dir / "results")
+        self.store = ResultStore(
+            self.settings.state_dir / "results",
+            ttl_seconds=self.settings.result_ttl_seconds,
+            cleanup_interval_seconds=self.settings.result_cleanup_interval_seconds,
+        )
+        self.requests = RequestJournal(self.settings.state_dir / "requests")
+        self.submissions_context = contextvars.ContextVar("submission_receipts", default=None)
         self.catalog = AssetCatalog(self.cfg, self.settings)
         self.runner = NativeSSHRunner(self.cfg, self.settings, store=self.store)
-        self.manager = JobManager(self.runner)
+        self.manager = RecoverableJobManager(self.runner, self.record_submission)
         self.schemas = {}
 
         @asynccontextmanager
         async def lifespan(server):
             with StateLock(self.settings.state_dir):
                 await self.catalog.start()
+                await self.store.start_retention()
                 try:
                     yield {}
                 finally:
+                    await self.requests.drain()
+                    await self.store.close_retention()
                     await self.catalog.close()
                     await self.runner.close()
 
@@ -99,6 +129,45 @@ class BridgeService:
             "jms-agent-bridge", version=__version__, instructions=INSTRUCTIONS, lifespan=lifespan
         )
         self.register()
+
+    async def record_submission(self, receipt):
+        rows = self.submissions_context.get()
+        if rows is not None:
+            for i, row in enumerate(rows):
+                if row["host"] == receipt["host"] and row["job_id"] == receipt["job_id"]:
+                    rows[i] = dict(receipt)
+                    break
+            else:
+                rows.append(dict(receipt))
+        await self.requests.aprogress("submission_receipts", receipt)
+
+    async def request_status(self, request_id):
+        receipt = await self.requests.astatus(request_id)
+        # The request response may have been interrupted after transport already
+        # saved a terminal result. Expose that evidence without executing anything
+        # or silently upgrading the whole request to successful/completed.
+        for row in receipt.get("execution_results", []):
+            try:
+                meta = await offload(self.store.metadata, row["result_id"])
+                row["result_status"] = {
+                    key: meta[key]
+                    for key in (
+                        "status",
+                        "ok",
+                        "exit_code",
+                        "executed",
+                        "execution_state",
+                        "completion_unknown",
+                        "timed_out",
+                        "queue_timed_out",
+                        "failure_stage",
+                        "finished_at",
+                    )
+                    if key in meta
+                }
+            except (ValueError, OSError):
+                row["result_status"] = {"status": "unavailable"}
+        return receipt
 
     def compact_exec_results(self, results):
         budget = 4096 // max(1, len(results))
@@ -109,7 +178,11 @@ class BridgeService:
                     "ok": r.ok,
                     "exit_code": r.exit_code,
                     "result_id": r.result_id,
-                    **self.store.preview(r.result_id, budget),
+                    **(
+                        preview_buffers(*r._bridge_output, budget)
+                        if hasattr(r, "_bridge_output")
+                        else self.store.preview(r.result_id, budget)
+                    ),
                 }
                 if hasattr(r, "result_id")
                 else r.to_dict(limit=budget)
@@ -124,6 +197,10 @@ class BridgeService:
             tool.name: tool.model_dump(mode="json", by_alias=True, exclude_none=True)
             for tool in await upstream.server.list_tools()
         }
+        for schema in self.schemas.values():
+            flag = schema.get("inputSchema", {}).get("properties", {}).get("allow_dangerous")
+            if flag is not None:
+                flag["description"] = DANGEROUS_FLAG_DESCRIPTION
         for name, desc in {
             "jms_exec": (
                 "Run a short command with the legacy environment: sources the asset's "
@@ -142,6 +219,19 @@ class BridgeService:
         }.items():
             self.schemas[name]["description"] = desc
         for name, description, props, required in [
+            (
+                "request_status",
+                "Read saved request/job/result receipts; never executes work. "
+                "Reconcile the original ID after reply loss; reusing it never replays.",
+                {"request_id": {"type": "string"}},
+                ["request_id"],
+            ),
+            (
+                "script_guard_check",
+                "Read-only diagnosis of the exact script guard; never executes supplied text.",
+                {"script": {"type": "string", "maxLength": 1048576}},
+                ["script"],
+            ),
             ("session_list", "List explicit persistent shells owned by this MCP service.", {}, []),
             (
                 "session_close",
@@ -160,7 +250,8 @@ class BridgeService:
                     "additionalProperties": False,
                 },
                 "annotations": {
-                    "readOnlyHint": name == "session_list",
+                    "readOnlyHint": name
+                    in ("session_list", "request_status", "script_guard_check"),
                     "destructiveHint": name == "session_close",
                 },
             }
@@ -179,6 +270,7 @@ class BridgeService:
         timeout=60,
         max_output_bytes=4096,
         allow_dangerous=False,
+        request_id=None,
     ):
         if (script is None) == (script_path is None):
             raise ValueError("provide exactly one of script or script_path")
@@ -190,12 +282,35 @@ class BridgeService:
             path = Path(script_path).expanduser()
             if not path.is_absolute() or not path.is_file():
                 raise ValueError("script_path must name an existing absolute local file")
-            script = path.read_text()
-        if upstream._looks_dangerous(script) and not allow_dangerous:
+            script = await offload(path.read_text)
+        if script_is_dangerous(script) and not allow_dangerous:
             raise ValueError(
                 "script matched the existing destructive-pattern guard; authorized "
                 "operations require allow_dangerous=true"
             )
+        if request_id is not None:
+            arguments = dict(
+                targets=targets,
+                script=script,
+                cwd=cwd,
+                env=env,
+                container=container,
+                image=image,
+                docker_args=docker_args,
+                session_id=session_id,
+                timeout=timeout,
+                max_output_bytes=max_output_bytes,
+                allow_dangerous=allow_dangerous,
+            )
+
+            async def perform():
+                token = self.runner.result_context.set(self.requests.receipts("execution_results"))
+                try:
+                    return await self.run(**arguments)
+                finally:
+                    self.runner.result_context.reset(token)
+
+            return await self.requests.execute(request_id, "run", arguments, perform)
         inventory = await self.catalog.ensure()
         hosts = inventory.resolve(targets)
         if not hosts:
@@ -219,6 +334,9 @@ class BridgeService:
 
         results = await asyncio.gather(*(one(host) for host in hosts))
         budget = max_output_bytes // max(1, len(results))
+        previews = await asyncio.gather(
+            *(offload(self.store.preview, r["result_id"], budget) for r in results)
+        )
         rows = [
             {
                 k: r[k]
@@ -242,11 +360,14 @@ class BridgeService:
                     "connection_state",
                     "session_state",
                     "reconnected",
+                    "timing",
+                    "queue_timed_out",
+                    "failure_stage",
                 )
             }
-            | self.store.preview(r["result_id"], budget)
+            | preview
             | ({"warning": r["warning"]} if r.get("warning") else {})
-            for r in results
+            for r, preview in zip(results, previews, strict=True)
         ]
         return {
             "ok": all(r["ok"] for r in results),
@@ -263,7 +384,7 @@ class BridgeService:
         to it. The safety guard returns a refusal, matching the legacy reply rather than
         raising, so a client migrating between modes sees the same shape.
         """
-        if upstream._looks_dangerous(command) and not allow_dangerous:
+        if script_is_dangerous(command) and not allow_dangerous:
             return {
                 "ok": False,
                 "error": (
@@ -297,6 +418,17 @@ class BridgeService:
                 "ssh_connections": self.runner.connection_status(),
                 "persistent_shells": self.runner.sessions(),
                 "result_directory": str(self.store.root),
+                "result_retention": self.store.retention_status(),
+                "execution": {
+                    **self.runner.scheduler.status(),
+                    "queue_timeout_seconds": self.runner.queue_timeout,
+                },
+                "login": {
+                    "serialized": True,
+                    "minimum_interval_seconds": 5,
+                    "in_progress": self.runner._connect_lock.locked(),
+                },
+                "requests": {"active": len(self.requests.tasks)},
             }
         if topic == "assets":
             await self.catalog.ensure()
@@ -326,7 +458,7 @@ class BridgeService:
             "next_offset": offset + len(selected) if offset + len(selected) < len(names) else None,
         }
 
-    async def call(self, operation, arguments):
+    async def call(self, operation, arguments, request_id=None):
         await self.load_schemas()
         if operation not in self.schemas:
             raise ValueError("unknown operation; discover its schema first")
@@ -334,6 +466,16 @@ class BridgeService:
         import jsonschema
 
         jsonschema.validate(arguments, self.schemas[operation]["inputSchema"])
+        if request_id is not None:
+            if operation != "jms_submit_job":
+                raise ValueError("call request_id currently supports only jms_submit_job")
+            return await self.requests.execute(
+                request_id, operation, arguments, lambda: self.call(operation, arguments)
+            )
+        if operation == "request_status":
+            return await self.request_status(arguments["request_id"])
+        if operation == "script_guard_check":
+            return check_script_guard(arguments["script"], upstream._DANGEROUS_PATTERNS)
         if operation == "jms_inventory_reload":
             value = await self.catalog.refresh()
         elif operation == "session_list":
@@ -386,7 +528,9 @@ class BridgeService:
                         "fanout_reply": self.compact_exec_results,
                     }
                 )
-                executions = []
+                executions = self.requests.receipts("execution_results")
+                submissions = []
+                submission_token = self.submissions_context.set(submissions)
                 result_token = self.runner.result_context.set(executions)
                 try:
                     value = unwrap(await upstream.server.call_tool(operation, arguments))
@@ -396,12 +540,15 @@ class BridgeService:
                             if isinstance(value, dict)
                             else {"data": value, "execution_results": executions}
                         )
+                    if submissions:
+                        value = {**value, "submission_receipts": submissions}
                 finally:
+                    self.submissions_context.reset(submission_token)
                     self.runner.result_context.reset(result_token)
                     upstream._runtime.reset(runtime_token)
                     await api.aclose()
-        result_id = self.store.save_json(value, kind="call", operation=operation)
-        raw_size = self.store.path(result_id, "result").stat().st_size
+        result_id = await offload(self.store.save_json, value, kind="call", operation=operation)
+        raw_size = (await offload(self.store.path(result_id, "result").stat)).st_size
         result = {
             "ok": not (isinstance(value, dict) and value.get("ok") is False),
             "result_id": result_id,
@@ -418,7 +565,7 @@ class BridgeService:
             "summary": summary,
             "total_bytes": raw_size,
             "truncated": True,
-            "preview": self.store.read(result_id, "result", limit=4096)["text"],
+            "preview": (await offload(self.store.read, result_id, "result", limit=4096))["text"],
         }
 
     def register(self):
@@ -439,12 +586,15 @@ class BridgeService:
             session_id: str | None = None,
             timeout: float = 60,
             max_output_bytes: int = 4096,
-            allow_dangerous: bool = False,
+            allow_dangerous: Annotated[bool, Field(description=DANGEROUS_FLAG_DESCRIPTION)] = False,
+            request_id: str | None = None,
         ) -> dict:
             """Run literal Bash or a local script file; optional remote Docker.
             Complete stdout/stderr are saved; read_result fetches more. Default runs are isolated.
             Explicit session_id retains shell state on each target. Timeout 1..600s; longer work
-            uses job operations.
+            uses job operations. request_id provides durable response-loss recovery.
+            allow_dangerous acknowledges only the local guard for an already-authorized command;
+            it never grants approval or overrides a client or JumpServer denial.
             """
             try:
                 return await self.run(
@@ -460,6 +610,7 @@ class BridgeService:
                     timeout,
                     max_output_bytes,
                     allow_dangerous,
+                    request_id,
                 )
             except (ValueError, OSError, ConfigError, InventoryError) as exc:
                 raise ToolError(str(exc)) from None
@@ -479,7 +630,9 @@ class BridgeService:
             Limit <=16384; continue with next_offset.
             """
             try:
-                return self.store.read(result_id, stream, offset, limit, tail, pattern)
+                return await offload(
+                    self.store.read, result_id, stream, offset, limit, tail, pattern
+                )
             except (ValueError, OSError) as exc:
                 raise ToolError(str(exc)) from None
 
@@ -504,14 +657,14 @@ class BridgeService:
         @server.tool(
             name="call", annotations=ToolAnnotations(destructiveHint=True, openWorldHint=True)
         )
-        async def call(operation: str, arguments: dict) -> dict:
+        async def call(operation: str, arguments: dict, request_id: str | None = None) -> dict:
             """Invoke an operation after discovering its schema.
             Read the full saved response with read_result(stream='result').
             """
             import jsonschema
 
             try:
-                return await self.call(operation, arguments)
+                return await self.call(operation, arguments, request_id)
             except jsonschema.ValidationError as exc:
                 raise ToolError(
                     "Invalid operation arguments at "

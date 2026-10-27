@@ -1,13 +1,29 @@
 """Private, durable results with bounded previews and byte-offset reads."""
 
+import asyncio
+import contextlib
+import functools
 import json
+import logging
+import math
 import os
 import re
+import shutil
+import threading
 import time
 import uuid
 from pathlib import Path
 
 from .runtime_config import default_state_dir
+
+
+def locked(method):
+    @functools.wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return wrapped
 
 
 def atomic_json(path, value):
@@ -24,8 +40,37 @@ def atomic_json(path, value):
         temp.unlink(missing_ok=True)
 
 
+def preview_buffers(stdout, stderr, budget):
+    """Same preview policy for compatibility operations which already read both streams."""
+    err_budget = min(len(stderr), max(0, budget // 2))
+    out_budget = min(len(stdout), max(0, budget - err_budget))
+    err_budget = min(len(stderr), max(0, budget - out_budget))
+    result = {}
+    for name, data, limit in [("stdout", stdout, out_budget), ("stderr", stderr, err_budget)]:
+        if data and limit:
+            result[name] = (data[-limit:] if name == "stderr" else data[:limit]).decode(
+                "utf-8", errors="replace"
+            )
+        if len(data) > limit:
+            result[name + "_truncated"] = True
+    return result
+
+
 class ResultStore:
-    def __init__(self, root=None):
+    def __init__(self, root=None, *, ttl_seconds=604800, cleanup_interval_seconds=3600):
+        if not all(
+            isinstance(v, (int, float)) and math.isfinite(v) and v > 0
+            for v in (ttl_seconds, cleanup_interval_seconds)
+        ):
+            raise ValueError("result TTL and cleanup interval must be positive finite seconds")
+        self.ttl_seconds = ttl_seconds
+        self.cleanup_interval_seconds = cleanup_interval_seconds
+        self._lock = threading.RLock()
+        self._status_lock = threading.Lock()
+        self._active = set()
+        self._cleanup_task = None
+        self._sweeper = None
+        self._last_cleanup = None
         self.root = Path(root) if root is not None else default_state_dir() / "results"
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.root.chmod(0o700)
@@ -35,12 +80,15 @@ class ResultStore:
             raise ValueError("invalid result_id")
         return self.root / result_id
 
+    @locked
     def create(self, **metadata):
         result_id = uuid.uuid4().hex
         directory = self.directory(result_id)
         directory.mkdir(mode=0o700)
         metadata.update(result_id=result_id, created_at=time.time(), status="running")
         atomic_json(directory / "meta.json", metadata)
+        with self._status_lock:
+            self._active.add(result_id)
         return result_id
 
     def path(self, result_id, stream):
@@ -48,29 +96,55 @@ class ResultStore:
             raise ValueError("stream must be stdout, stderr, or result")
         return self.directory(result_id) / (stream + (".json" if stream == "result" else ".log"))
 
+    async def acreate(self, **metadata):
+        from .async_io import offload
+
+        def abandoned(result_id):
+            self.finish(
+                result_id,
+                ok=False,
+                executed=False,
+                execution_state="not_started",
+                completion_unknown=False,
+                exit_code=130,
+            )
+
+        return await offload(self.create, on_cancel=abandoned, **metadata)
+
+    @locked
     def metadata(self, result_id):
         try:
             return json.loads((self.directory(result_id) / "meta.json").read_text())
         except FileNotFoundError:
-            raise ValueError("unknown result_id") from None
+            raise ValueError(
+                "unknown or expired result_id; result outputs are retained for "
+                + str(self.ttl_seconds)
+                + " seconds"
+            ) from None
 
+    @locked
     def finish(self, result_id, **values):
         meta = self.metadata(result_id)
-        meta.update(values, status="complete", finished_at=time.time())
+        now = time.time()
+        meta.update(values, status="complete", finished_at=now, expires_at=now + self.ttl_seconds)
         meta["bytes"] = {
             s: self.path(result_id, s).stat().st_size
             for s in ("stdout", "stderr", "result")
             if self.path(result_id, s).exists()
         }
         atomic_json(self.directory(result_id) / "meta.json", meta)
+        with self._status_lock:
+            self._active.discard(result_id)
         return meta
 
+    @locked
     def save_json(self, value, **meta):
         result_id = self.create(**meta)
         atomic_json(self.path(result_id, "result"), value)
         self.finish(result_id, ok=not (isinstance(value, dict) and value.get("ok") is False))
         return result_id
 
+    @locked
     def preview(self, result_id, budget=4096):
         meta = self.metadata(result_id)
         sizes = meta.get("bytes", {})
@@ -92,6 +166,7 @@ class ResultStore:
                 result[stream + "_truncated"] = True
         return result
 
+    @locked
     def read(self, result_id, stream="stdout", offset=0, limit=4096, tail=False, pattern=None):
         meta = self.metadata(result_id)
         if not 1 <= limit <= 16384 or offset < 0:
@@ -162,3 +237,115 @@ class ResultStore:
             "total_bytes": size,
             "eof": cursor >= size,
         }
+
+    def retention_status(self):
+        # Pure in-memory status must not queue behind fsync or directory scans.
+        # Mutations still hold the I/O lock; this short lock only protects status.
+        with self._status_lock:
+            return dict(
+                ttl_seconds=self.ttl_seconds,
+                cleanup_interval_seconds=self.cleanup_interval_seconds,
+                active_results=len(self._active),
+                last_cleanup=self._last_cleanup,
+                request_receipts="retained separately; TTL never enables request replay",
+            )
+
+    def cleanup(self, now=None):
+        """Expire completed outputs and abandoned old results; never live writers.
+
+        Only this store's UUID directories are eligible. Rename under the same
+        lock as reads to prevent partial reads, then unlink outside the lock.
+        Never follow a symlink or touch the separate request journal.
+        """
+        now = time.time() if now is None else now
+        report = dict(
+            at=now,
+            removed=0,
+            removed_bytes=0,
+            active_skipped=0,
+            invalid_skipped=0,
+            abandoned_removed=0,
+            errors=0,
+        )
+        with os.scandir(self.root) as entries:
+            for entry in entries:
+                rid = entry.name
+                garbage = re.fullmatch(r"\.gc-[0-9a-f]{32}", rid)
+                if not (re.fullmatch(r"[0-9a-f]{32}", rid) or garbage):
+                    continue
+                if not entry.is_dir(follow_symlinks=False):
+                    continue
+                try:
+                    with self._lock:
+                        directory = Path(entry.path)
+                        if rid in self._active:
+                            report["active_skipped"] += 1
+                            continue
+                        if not garbage:
+                            meta_path = directory / "meta.json"
+                            if meta_path.is_symlink():
+                                report["invalid_skipped"] += 1
+                                continue
+                            try:
+                                meta = json.loads(meta_path.read_text())
+                                stamp = (
+                                    meta.get("finished_at")
+                                    if meta.get("status") == "complete"
+                                    else meta.get("created_at")
+                                )
+                                if not isinstance(stamp, (int, float)) or not math.isfinite(stamp):
+                                    raise ValueError("invalid timestamp")
+                            except (ValueError, TypeError, AttributeError, FileNotFoundError):
+                                report["invalid_skipped"] += 1
+                                continue
+                            if now - stamp < self.ttl_seconds:
+                                continue
+                            if meta.get("status") != "complete":
+                                report["abandoned_removed"] += 1
+                            trash = self.root / (".gc-" + rid)
+                            directory.rename(trash)
+                        else:
+                            trash = directory
+                    # Result directories contain only store-owned output files.
+                    size = sum(
+                        p.stat(follow_symlinks=False).st_size
+                        for p in trash.iterdir()
+                        if not p.is_symlink() and p.is_file()
+                    )
+                    shutil.rmtree(trash)
+                    report["removed"] += 1
+                    report["removed_bytes"] += size
+                except OSError:
+                    report["errors"] += 1
+        with self._status_lock:
+            self._last_cleanup = report
+        logging.getLogger(__name__).info("result_retention %s", json.dumps(report))
+        return report
+
+    async def start_retention(self):
+        if self._cleanup_task is not None:
+            return
+
+        async def loop():
+            while True:
+                try:
+                    self._sweeper = asyncio.create_task(asyncio.to_thread(self.cleanup))
+                    await asyncio.shield(self._sweeper)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logging.getLogger(__name__).exception(
+                        "result retention failed; retrying next interval"
+                    )
+                await asyncio.sleep(self.cleanup_interval_seconds)
+
+        self._cleanup_task = asyncio.create_task(loop(), name="jms-result-retention")
+
+    async def close_retention(self):
+        if self._cleanup_task is not None:
+            self._cleanup_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._cleanup_task
+            self._cleanup_task = None
+        if self._sweeper is not None:
+            await asyncio.gather(self._sweeper, return_exceptions=True)

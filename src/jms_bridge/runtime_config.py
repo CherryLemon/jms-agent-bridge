@@ -21,6 +21,11 @@ def default_state_dir() -> Path:
 class BridgeSettings:
     state_dir: Path = field(default_factory=default_state_dir)
     refresh_interval: int = 3600
+    execution_limit: int | None = None
+    inspection_reserved: int = 0
+    queue_timeout: float = 60
+    result_ttl_seconds: float = 604800
+    result_cleanup_interval_seconds: float = 3600
     preferred_account: str | None = None
     rest_proxy: str | None = None
     ssh_host: str | None = None
@@ -42,6 +47,28 @@ def load_settings() -> BridgeSettings:
     interval = data.get("refresh_interval", 3600)
     if isinstance(interval, bool) or not isinstance(interval, int) or interval < 1:
         raise ConfigError("bridge.refresh_interval must be a positive integer")
+    import math
+
+    for name in ("execution_limit", "inspection_reserved"):
+        value = data.get(name)
+        if value is not None and (
+            type(value) is not int or value < (0 if name == "inspection_reserved" else 1)
+        ):
+            raise ConfigError(f"bridge.{name} must be a valid integer")
+    for name in ("queue_timeout", "result_ttl_seconds", "result_cleanup_interval_seconds"):
+        value = data.get(name, 1)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (float, int))
+            or not math.isfinite(value)
+            or value <= 0
+        ):
+            raise ConfigError(f"bridge.{name} must be positive and finite")
+    if (
+        data.get("execution_limit") is not None
+        and data.get("inspection_reserved", 0) >= data["execution_limit"]
+    ):
+        raise ConfigError("bridge.inspection_reserved must be less than execution_limit")
     command = data.get("ssh_proxy_command", [])
     if not isinstance(command, list) or any(
         not isinstance(s, str) or not s or "\x00" in s for s in command
@@ -61,6 +88,17 @@ def load_settings() -> BridgeSettings:
     return BridgeSettings(
         state_dir=Path(state).expanduser() if state else default_state_dir(),
         refresh_interval=interval,
+        **{
+            name: data[name]
+            for name in (
+                "execution_limit",
+                "inspection_reserved",
+                "queue_timeout",
+                "result_ttl_seconds",
+                "result_cleanup_interval_seconds",
+            )
+            if name in data
+        },
         preferred_account=data.get("preferred_account"),
         rest_proxy=data.get("rest_proxy"),
         ssh_host=data.get("ssh_host"),

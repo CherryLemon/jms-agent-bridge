@@ -46,6 +46,12 @@ preferred_account = "root"
 # This is an argv array, never a locally interpreted shell command:
 # ssh_proxy_command = ["nc", "-X", "connect", "-x", "proxy.example.com:3128", "gateway.example.com", "2222"]
 # state_dir = "~/.local/state/jms-bridge"
+# Active commands are separate from authentication and idle connections.
+# execution_limit = 8       # Unset: use bastion.max_parallel.
+# inspection_reserved = 2   # Default 0; must be less than the effective limit.
+# queue_timeout = 60        # Separate from remote execution timeout.
+# result_ttl_seconds = 604800
+# result_cleanup_interval_seconds = 3600
 ```
 
 `JMS_BRIDGE_STATE_DIR` overrides `bridge.state_dir`; otherwise `XDG_STATE_HOME`
@@ -95,8 +101,38 @@ byte budget across targets and reserve space for stderr. `max_output_bytes` is
 256..16384. Pages are at most 16384 bytes plus up to three bytes for UTF-8 alignment.
 Non-UTF-8 bytes remain intact on disk and display with replacement characters.
 Literal searches return bounded snippets and a continuation cursor, scanning at
-most 8 MiB per request. Files are not automatically expired: operators manage
-retention when no clients need the saved result IDs.
+most 8 MiB per request. Completed outputs expire after 7 days by default, with a
+startup and hourly sweep. Reads do not extend retention. Active writers are
+protected; old orphan outputs from a prior service expire from creation time.
+Cleanup never removes remote source files or job directories. Request receipts
+are stored separately and retained so output expiry never enables re-execution.
+
+Set a unique `request_id` on `run` or on
+`call(operation="jms_submit_job", arguments={...}, request_id="...")` before
+starting important work. After a lost response, discover/call `request_status`
+with the original ID. Reusing the same ID and arguments returns the receipt;
+changed arguments are rejected. Caller cancellation leaves an accepted request
+owned by the resident service. A restart never resumes or replays it: reconcile
+saved result/job IDs when `completion_unknown` is true. A prepared job ID is a
+reconciliation candidate, not proof that the remote launcher acknowledged it.
+
+The existing destructive-pattern guard is a local typo check.
+`allow_dangerous=true` acknowledges that check for a specific command already
+authorized by the user; it neither grants approval nor overrides client review,
+OS permissions or JumpServer policy. `script_guard_check` diagnoses the live
+predicate without executing the script. A narrow literal `python3 -I -S -`
+heredoc can ignore proven Python comment tokens; strings, executable text,
+malformed input and unsupported shell forms retain the original checks.
+
+Execution capacity is consumed only by active commands, not cold authentication
+or idle SSH connections. General work cannot consume the configured inspection
+reserve; inspection can use idle general capacity. Waiting for one named shell
+does not occupy another execution slot. Queue expiry means `not_started`, while
+timeout/disconnect after transmission remains uncertain and is never replayed.
+Status reports active/queued work, retention and owned requests. Performance logs
+separate queue, connection, channel, execution, login wait/pacing, handshake and
+authentication timing without logging scripts or credentials. Login pacing stays
+at its existing five seconds.
 
 Default runs start isolated `bash -s` processes with `set -euo pipefail`.
 An explicit `session_id` retains a Bash shell's directory, exports, functions, and
