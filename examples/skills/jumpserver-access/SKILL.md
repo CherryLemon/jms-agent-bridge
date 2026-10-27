@@ -5,12 +5,21 @@ description: Run scripts, remote Docker commands, jobs, accelerator occupancy, a
 
 # JumpServer access
 
-Use the configured bridge's four tools: `run`, `read_result`, `discover`, `call`.
+Use the configured bridge's five tools: `fs`, `run`, `read_result`, `discover`, `call`.
 Client-specific prefixes may differ.
 
 - Find authorized targets with `discover(topic="assets", query="<name or address>")`.
   Use an exact returned name or UUID. REST refreshes hourly; YAML does not grant
   target access. Do not fan out to `all` unless the task calls for it.
+- Use `fs` for `list`, `stat`, `read`, `read_many`, `glob`, `search`, `tree`,
+  `checksum`, `upload` and `download`. Discover `jms_fs` for its schema. Paths and
+  patterns are data; no shell quoting is needed. Use `read_many` for several
+  known files, byte cursors for text and row offsets for search/directory pages.
+  An optional existing `container` changes the remote view. Upload/download write
+  their destination; `local_path` refers to the MCP server machine. Reconcile
+  transfers with the original `request_id` after a lost reply.
+  If storage is shared, first verify the deployment's local/remote path mapping
+  and use local access instead of transmitting the same files through the gateway.
 - Pass literal Bash as `run(targets=[...], script="...")`, or use an absolute local
   `script_path`. Use `cwd`, `env`, `container` or `image` instead of nested quoting.
   `docker_args` is an argv list. Do not encode the script or add shell quote layers.

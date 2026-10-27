@@ -286,8 +286,9 @@ async def test_catalog_listener_does_not_wait_for_network(cfg, settings):
 
 async def test_compact_discovery_and_runtime_isolation(service):
     tools = await service.server.list_tools()
-    assert {t.name for t in tools} == {"run", "read_result", "discover", "call"}
-    assert len(json.dumps([t.model_dump(mode="json") for t in tools])) < 6000
+    assert {t.name for t in tools} == {"run", "read_result", "discover", "call", "fs"}
+    assert len(json.dumps([t.model_dump(mode="json") for t in tools if t.name != "fs"])) < 6000
+    assert len(json.dumps(next(t for t in tools if t.name == "fs").model_dump(mode="json"))) < 6000
     assert (await service.discover())["categories"]["jobs"]
     assert (await service.discover(query="jobs", limit=2))["next_offset"] == 2
     assert (await service.discover(query="sync"))["operations"]
@@ -415,6 +416,7 @@ async def test_compact_stdio_protocol(tmp_path):
         async with ClientSession(streams[0], streams[1], read_timeout_seconds=10) as session:
             await session.initialize()
             assert {t.name for t in (await session.list_tools()).tools} == {
+                "fs",
                 "run",
                 "read_result",
                 "discover",

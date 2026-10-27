@@ -1,4 +1,4 @@
-"""Four-tool MCP facade with progressive disclosure and REST-backed targets."""
+"""Five-tool MCP facade with progressive disclosure and REST-backed targets."""
 
 import asyncio
 import contextvars
@@ -21,6 +21,10 @@ from .accelerator_inspection import AcceleratorInspector
 from .async_io import offload
 from .comment_guard import check as check_script_guard
 from .config import ConfigError, load_config
+from .filesystem import OPERATION as FS_OPERATION
+from .filesystem import SCHEMA as FS_SCHEMA
+from .filesystem import Filesystem
+from .filesystem import validate as validate_fs
 from .inventory import InventoryError
 from .native_ssh import NativeSSHRunner
 from .recoverable_jobs import RecoverableJobManager
@@ -51,6 +55,7 @@ CATEGORIES = {
     "audit": ["jms_audit_query", "jms_create_ticket"],
     "sessions": ["session_list", "session_close"],
     "requests": ["request_status"],
+    "fs": [FS_OPERATION],
     "guard": ["script_guard_check"],
 }
 DANGEROUS_FLAG_DESCRIPTION = (
@@ -59,7 +64,7 @@ DANGEROUS_FLAG_DESCRIPTION = (
     "or record approval, or override Codex automatic review, OS permissions, or JumpServer "
     "policy. Do not use it to retry an external approval denial."
 )
-INSTRUCTIONS = """JumpServer access through four tools.
+INSTRUCTIONS = """JumpServer access through five tools: run, fs, read_result, discover, call.
 After a lost reply, query request_status with the original request_id; never blindly replay.
 Saved outputs expire after a configurable TTL (default 7 days); receipts remain for deduplication.
 allow_dangerous acknowledges only the local pattern guard for an already-authorized command;
@@ -112,6 +117,7 @@ class BridgeService:
         self.submissions_context = contextvars.ContextVar("submission_receipts", default=None)
         self.catalog = AssetCatalog(self.cfg, self.settings)
         self.runner = NativeSSHRunner(self.cfg, self.settings, store=self.store)
+        self.filesystem = Filesystem(self.catalog, self.runner, self.store)
         self.inspector = AcceleratorInspector(self.catalog, self.runner, self.store)
         self.manager = RecoverableJobManager(self.runner, self.record_submission)
         self.schemas = {}
@@ -125,6 +131,7 @@ class BridgeService:
                     yield {}
                 finally:
                     await self.requests.drain()
+                    await self.filesystem.workers.close()
                     await self.store.close_retention()
                     await self.catalog.close()
                     await self.runner.close()
@@ -202,6 +209,7 @@ class BridgeService:
             for tool in await upstream.server.list_tools()
         }
         self.schemas[INSPECT_OPERATION] = INSPECT_SCHEMA
+        self.schemas[FS_OPERATION] = FS_SCHEMA
         for schema in self.schemas.values():
             flag = schema.get("inputSchema", {}).get("properties", {}).get("allow_dangerous")
             if flag is not None:
@@ -424,6 +432,7 @@ class BridgeService:
                 "persistent_shells": self.runner.sessions(),
                 "result_directory": str(self.store.root),
                 "result_retention": self.store.retention_status(),
+                "filesystem_workers": self.filesystem.workers.status(),
                 "execution": {
                     **self.runner.scheduler.status(),
                     "queue_timeout_seconds": self.runner.queue_timeout,
@@ -477,6 +486,8 @@ class BridgeService:
             return await self.requests.execute(
                 request_id, operation, arguments, lambda: self.call(operation, arguments)
             )
+        if operation == FS_OPERATION:
+            return await self.fs(arguments, _validated=True)
         if operation == INSPECT_OPERATION:
             return await self.inspector.inspect(**arguments)
         if operation == "request_status":
@@ -575,8 +586,122 @@ class BridgeService:
             "preview": (await offload(self.store.read, result_id, "result", limit=4096))["text"],
         }
 
+    async def fs(self, arguments, *, _validated=False):
+        if not _validated:
+            import jsonschema
+
+            jsonschema.validate(arguments, FS_SCHEMA["inputSchema"])
+        validate_fs(arguments)
+        args = dict(arguments)
+        request_id = args.pop("request_id", None)
+        if request_id is not None:
+
+            async def perform():
+                token = self.runner.result_context.set(self.requests.receipts("execution_results"))
+                try:
+                    return await self.filesystem.execute(**args)
+                finally:
+                    self.runner.result_context.reset(token)
+
+            return await self.requests.execute(request_id, "fs", args, perform)
+        return await self.filesystem.execute(**args)
+
     def register(self):
         server = self.server
+
+        @server.tool(
+            name="fs",
+            annotations=ToolAnnotations(
+                readOnlyHint=False, destructiveHint=True, openWorldHint=True
+            ),
+        )
+        async def fs(
+            target: str,
+            action: Literal[
+                "list",
+                "stat",
+                "read",
+                "read_many",
+                "glob",
+                "search",
+                "tree",
+                "checksum",
+                "upload",
+                "download",
+            ],
+            path: str | None = None,
+            paths: list[str] | None = None,
+            container: str | None = None,
+            pattern: str | None = None,
+            local_path: str | None = None,
+            overwrite: bool | None = None,
+            request_id: str | None = None,
+            start_line: int | None = None,
+            line_count: int | None = None,
+            byte_offset: int | None = None,
+            tail: bool | None = None,
+            offset: int | None = None,
+            limit: int | None = None,
+            max_bytes: int | None = None,
+            depth: int | None = None,
+            literal: bool | None = None,
+            case_sensitive: bool | None = None,
+            include: list[str] | None = None,
+            exclude: list[str] | None = None,
+            hidden: bool | None = None,
+            respect_ignore: bool | None = None,
+            context_lines: int | None = None,
+            max_file_bytes: int | None = None,
+            timeout: int | None = None,
+        ) -> dict:
+            """Explore files or transfer them on one exact REST asset; optional existing container.
+            Absolute paths/patterns are data, not shell. Exploration actions are read-only;
+            upload/download write destinations. local_path is on this MCP machine;
+            path is remote. overwrite=false skips existing files (directory metadata may sync);
+            extras are never deleted. Set request_id for transfers; recover via request_status.
+            Bounded pages: read uses byte_offset; list/glob/search/tree use offset/limit.
+            Search defaults literal, case-sensitive. result_id saves this page, not unseen pages.
+            discover(operation='jms_fs') provides action-specific options, defaults and limits."""
+            import jsonschema
+
+            arguments = dict(
+                target=target,
+                action=action,
+                path=path,
+                paths=paths,
+                container=container,
+                pattern=pattern,
+                local_path=local_path,
+                overwrite=overwrite,
+                request_id=request_id,
+                start_line=start_line,
+                line_count=line_count,
+                byte_offset=byte_offset,
+                tail=tail,
+                offset=offset,
+                limit=limit,
+                max_bytes=max_bytes,
+                depth=depth,
+                literal=literal,
+                case_sensitive=case_sensitive,
+                include=include,
+                exclude=exclude,
+                hidden=hidden,
+                respect_ignore=respect_ignore,
+                context_lines=context_lines,
+                max_file_bytes=max_file_bytes,
+                timeout=timeout,
+            )
+            try:
+                return await self.fs({k: v for k, v in arguments.items() if v is not None})
+            except jsonschema.ValidationError as exc:
+                raise ToolError(
+                    "Invalid fs arguments at "
+                    + ".".join(map(str, exc.path))
+                    + "; discover jms_fs for details"
+                ) from None
+            except (ValueError, OSError, ConfigError, InventoryError) as exc:
+                raise ToolError(str(exc)) from None
 
         @server.tool(
             name="run", annotations=ToolAnnotations(destructiveHint=True, openWorldHint=True)

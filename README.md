@@ -19,7 +19,7 @@ bastion, and your credentials stay in your own key agent and config file.
 
 ## Compact resident mode
 
-An optional [four-tool resident service](docs/compact-service.md) provides
+An optional [five-tool resident service](docs/compact-service.md) provides
 `run`, `read_result`, `discover`, and `call`, complete output files, native SSH
 connection reuse with explicit persistent shells, remote Docker, and hourly REST
 asset discovery. Install `pip install "jms-agent-bridge[compact]"` and run
