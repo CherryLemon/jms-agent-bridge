@@ -2,7 +2,7 @@
 --------------------- Enflame System Management Interface ---------------------
 --------- Enflame Tech, All Rights Reserved. 2024-2026 Copyright (C) ----------
 -------------------------------------------------------------------------------
-                                                                               
+
 +2026-10-21, 19:07:51 CST-----------------------------------------------------+
 | EFSMI: 1.9.10                Driver Ver: 1.9.10                             |
 +-----------------------------+-------------------+---------------------------+
@@ -37,9 +37,9 @@
 --------------------- Enflame System Management Interface ---------------------
 --------- Enflame Tech, All Rights Reserved. 2024-2026 Copyright (C) ----------
 -------------------------------------------------------------------------------
-                                                                               
-*Dev Pid      DevMem  SysMem  Command           
-*Idx #        %       M       Name              
+
+*Dev Pid      DevMem  SysMem  Command
+*Idx #        %       M       Name
 0    N/A      N/A     N/A     no process running on
 1    N/A      N/A     N/A     no process running on
 2    N/A      N/A     N/A     no process running on
