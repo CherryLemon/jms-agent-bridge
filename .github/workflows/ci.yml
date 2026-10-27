@@ -6,6 +6,17 @@ on:
   pull_request:
 
 jobs:
+  remote-probe:
+    name: Remote filesystem probe (Python 3.8)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.8"
+      # Target-side probe is stdlib-only; server dependencies require Python 3.10+.
+      - run: python -I -S tests/remote/test_filesystem_compat.py
+
   lint:
     name: Lint
     runs-on: ubuntu-latest

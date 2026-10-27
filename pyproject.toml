@@ -56,6 +56,11 @@ target-version = "py310"
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
 
+# These files run on target hosts without importing the Python 3.10+ MCP server.
+[tool.ruff.per-file-target-version]
+"src/jms_bridge/fs_probe.py" = "py38"
+"tests/remote/test_filesystem_compat.py" = "py38"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
