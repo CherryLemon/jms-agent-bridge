@@ -163,9 +163,9 @@ async def test_isolation_literal_stdin_and_lossless_output(loopback):
 
 async def test_named_shell_serializes_and_persists(loopback):
     t = loopback
-    assert (await run(t, "export VALUE=retained; cd /", session_id="task"))["ok"]
+    assert (await run(t, "export VALUE=retained; COUNT=0; cd /", session_id="task"))["ok"]
     first, second = await asyncio.gather(
-        run(t, "sleep .05; COUNT=1", session_id="task"),
+        run(t, "before=$COUNT; sleep .05; COUNT=$((before+1))", session_id="task"),
         run(t, "COUNT=$((COUNT+1))", session_id="task"),
     )
     assert first["ok"] and second["ok"]

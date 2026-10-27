@@ -17,6 +17,15 @@ Client-specific prefixes may differ.
 - Output is saved completely. Start with the compact preview, then use
   `read_result` with `stream`, byte `offset`/`limit`, `tail`, or a literal `pattern`.
   Continue from `next_offset`; clipped previews are not complete logs.
+- For important runs and job submission, generate a unique `request_id` before
+  calling. After a lost reply, discover/call `request_status` with that original
+  ID; do not invent another ID or submit again while completion is unknown.
+  Repeated IDs never replay work. Saved output expires after the configured TTL
+  (default 7 days); receipts remain and reads do not renew retention.
+- `allow_dangerous` acknowledges only the local pattern guard for a specific
+  action already authorized by the user. It does not grant approval or override
+  client review or JumpServer policy. `script_guard_check` diagnoses that guard
+  without executing anything. Do not change channels to retry an external denial.
 - Discover a category such as `jobs` or `files`, then request one operation's
   schema with `discover(operation="...")` before invoking `call`. Large operation
   responses are read using `read_result(stream="result")`; `execution_results`
