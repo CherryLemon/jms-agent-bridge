@@ -1,6 +1,6 @@
 ---
 name: jumpserver-access
-description: Run scripts, remote Docker commands, jobs, and file transfers on JumpServer assets through the compact jms-agent-bridge MCP service.
+description: Run scripts, remote Docker commands, jobs, accelerator occupancy, and file transfers on JumpServer assets through the compact jms-agent-bridge MCP service.
 ---
 
 # JumpServer access
@@ -41,6 +41,11 @@ Client-specific prefixes may differ.
   Use a new ID and reapply setup, or explicitly close/reset the previous ID. Do not
   assume reconnecting restores shell state. Avoid changing the shell's standard
   streams, `exit`/`exec`, and unmanaged background commands in retained shells.
+- To find available GPUs/NPUs, discover `jms_accelerator_status`, then call it
+  with at most 8 exact REST targets. It returns utilization, memory, PID/user,
+  container and task summaries; full details are saved. Unknown/incomplete data
+  is never free. A snapshot is not a reservation; recheck before launching work.
+  Split a larger fleet explicitly rather than requesting `all` or wildcards.
 - For background or long work, discover job operations. `run` is bounded to 600
   seconds. A timeout does not prove that a remote process stopped.
 - `discover(topic="status")` reports connection and inventory state. A stale REST

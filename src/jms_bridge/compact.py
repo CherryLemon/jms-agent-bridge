@@ -15,6 +15,9 @@ from pydantic import Field
 
 from . import __version__
 from . import server as upstream
+from .accelerator_inspection import OPERATION as INSPECT_OPERATION
+from .accelerator_inspection import SCHEMA as INSPECT_SCHEMA
+from .accelerator_inspection import AcceleratorInspector
 from .async_io import offload
 from .comment_guard import check as check_script_guard
 from .config import ConfigError, load_config
@@ -28,7 +31,7 @@ from .runtime_config import StateLock, load_settings
 
 CATEGORIES = {
     "assets": ["jms_list_assets", "jms_asset_detail", "jms_inventory_reload"],
-    "inspect": ["jms_probe", "jms_fleet_summary", "jms_exec"],
+    "inspect": [INSPECT_OPERATION, "jms_probe", "jms_fleet_summary", "jms_exec"],
     "files": ["jms_sync_push", "jms_sync_pull", "jms_pull_artifacts"],
     "jobs": [
         "jms_submit_job",
@@ -109,6 +112,7 @@ class BridgeService:
         self.submissions_context = contextvars.ContextVar("submission_receipts", default=None)
         self.catalog = AssetCatalog(self.cfg, self.settings)
         self.runner = NativeSSHRunner(self.cfg, self.settings, store=self.store)
+        self.inspector = AcceleratorInspector(self.catalog, self.runner, self.store)
         self.manager = RecoverableJobManager(self.runner, self.record_submission)
         self.schemas = {}
 
@@ -197,6 +201,7 @@ class BridgeService:
             tool.name: tool.model_dump(mode="json", by_alias=True, exclude_none=True)
             for tool in await upstream.server.list_tools()
         }
+        self.schemas[INSPECT_OPERATION] = INSPECT_SCHEMA
         for schema in self.schemas.values():
             flag = schema.get("inputSchema", {}).get("properties", {}).get("allow_dangerous")
             if flag is not None:
@@ -472,6 +477,8 @@ class BridgeService:
             return await self.requests.execute(
                 request_id, operation, arguments, lambda: self.call(operation, arguments)
             )
+        if operation == INSPECT_OPERATION:
+            return await self.inspector.inspect(**arguments)
         if operation == "request_status":
             return await self.request_status(arguments["request_id"])
         if operation == "script_guard_check":

@@ -1,0 +1,147 @@
+Wed Oct 21 19:07:53 2026
+---------------------------------------------------------------------
+    mthreads-gmi:2.3.2           Driver Version:3.3.5-server
+---------------------------------------------------------------------
+ID   Name                 |PCIe                |%GPU  Mem
+     Device Type   Perf   |Pcie Lane Width     |Temp  MPC Capable
+                                               |      ECC Mode
++-------------------------------------------------------------------+
+0    MTT S5000            |00000000:03:00.0    |37%   79025MiB(81920MiB)
+     Physical      P0     |16x(16x)            |34C   YES
+                                               |      On-die, EDC
++-------------------------------------------------------------------+
+1    MTT S5000            |00000000:24:00.0    |39%   78949MiB(81920MiB)
+     Physical      P0     |16x(16x)            |35C   YES
+                                               |      On-die, EDC
++-------------------------------------------------------------------+
+2    MTT S5000            |00000000:44:00.0    |35%   78983MiB(81920MiB)
+     Physical      P0     |16x(16x)            |35C   YES
+                                               |      On-die, EDC
++-------------------------------------------------------------------+
+3    MTT S5000            |00000000:63:00.0    |35%   78909MiB(81920MiB)
+     Physical      P0     |16x(16x)            |36C   YES
+                                               |      On-die, EDC
++-------------------------------------------------------------------+
+4    MTT S5000            |00000000:83:00.0    |35%   78949MiB(81920MiB)
+     Physical      P0     |16x(16x)            |34C   YES
+                                               |      On-die, EDC
++-------------------------------------------------------------------+
+5    MTT S5000            |00000000:a3:00.0    |34%   78955MiB(81920MiB)
+     Physical      P0     |16x(16x)            |35C   YES
+                                               |      On-die, EDC
++-------------------------------------------------------------------+
+6    MTT S5000            |00000000:c3:00.0    |35%   78949MiB(81920MiB)
+     Physical      P0     |16x(16x)            |34C   YES
+                                               |      On-die, EDC
++-------------------------------------------------------------------+
+7    MTT S5000            |00000000:e3:00.0    |34%   78949MiB(81920MiB)
+     Physical      P0     |16x(16x)            |35C   YES
+                                               |      On-die, EDC
+---------------------------------------------------------------------
+
+---------------------------------------------------------------------
+Processes:
+ID   PID           Process name                           GPU Memory
+                                                               Usage
++-------------------------------------------------------------------+
+0    41006       python                                      40MiB
+0    41007       ...rtualenvs/sglang-0.5.6/bin/python        40MiB
+0    41008       sglang::data_parallel_controller            39MiB
+0    41009       sglang::detokenizer                         41MiB
+0    41010       sglang::scheduler_DP0_TP0                78549MiB
+0    41011       sglang::scheduler_DP0_TP1                   44MiB
+0    41012       sglang::scheduler_DP0_TP2                   44MiB
+0    41013       sglang::scheduler_DP0_TP3                   44MiB
+0    41014       sglang::scheduler_DP0_TP4                   44MiB
+0    41015       sglang::scheduler_DP0_TP5                   44MiB
+0    41016       sglang::scheduler_DP0_TP6                   44MiB
+0    41017       sglang::scheduler_DP0_TP7                   44MiB
++-------------------------------------------------------------------+
+1    41006       python                                       2MiB
+1    41007       ...rtualenvs/sglang-0.5.6/bin/python         2MiB
+1    41008       sglang::data_parallel_controller             2MiB
+1    41009       sglang::detokenizer                          2MiB
+1    41010       sglang::scheduler_DP0_TP0                   44MiB
+1    41011       sglang::scheduler_DP0_TP1                78630MiB
+1    41012       sglang::scheduler_DP0_TP2                   44MiB
+1    41013       sglang::scheduler_DP0_TP3                   44MiB
+1    41014       sglang::scheduler_DP0_TP4                   44MiB
+1    41015       sglang::scheduler_DP0_TP5                   44MiB
+1    41016       sglang::scheduler_DP0_TP6                   44MiB
+1    41017       sglang::scheduler_DP0_TP7                   44MiB
++-------------------------------------------------------------------+
+2    41006       python                                       2MiB
+2    41007       ...rtualenvs/sglang-0.5.6/bin/python         1MiB
+2    41009       sglang::detokenizer                          2MiB
+2    41010       sglang::scheduler_DP0_TP0                   44MiB
+2    41011       sglang::scheduler_DP0_TP1                   45MiB
+2    41012       sglang::scheduler_DP0_TP2                78662MiB
+2    41013       sglang::scheduler_DP0_TP3                   44MiB
+2    41014       sglang::scheduler_DP0_TP4                   43MiB
+2    41015       sglang::scheduler_DP0_TP5                   44MiB
+2    41016       sglang::scheduler_DP0_TP6                   44MiB
+2    41017       sglang::scheduler_DP0_TP7                   44MiB
++-------------------------------------------------------------------+
+3    41006       python                                       2MiB
+3    41007       ...rtualenvs/sglang-0.5.6/bin/python         1MiB
+3    41008       sglang::data_parallel_controller            <1MiB
+3    41009       sglang::detokenizer                          2MiB
+3    41010       sglang::scheduler_DP0_TP0                   43MiB
+3    41011       sglang::scheduler_DP0_TP1                   45MiB
+3    41012       sglang::scheduler_DP0_TP2                   44MiB
+3    41013       sglang::scheduler_DP0_TP3                78588MiB
+3    41014       sglang::scheduler_DP0_TP4                   44MiB
+3    41015       sglang::scheduler_DP0_TP5                   44MiB
+3    41016       sglang::scheduler_DP0_TP6                   43MiB
+3    41017       sglang::scheduler_DP0_TP7                   44MiB
++-------------------------------------------------------------------+
+4    41006       python                                       2MiB
+4    41007       ...rtualenvs/sglang-0.5.6/bin/python         1MiB
+4    41008       sglang::data_parallel_controller            <1MiB
+4    41009       sglang::detokenizer                          2MiB
+4    41010       sglang::scheduler_DP0_TP0                   44MiB
+4    41011       sglang::scheduler_DP0_TP1                   43MiB
+4    41012       sglang::scheduler_DP0_TP2                   44MiB
+4    41013       sglang::scheduler_DP0_TP3                   44MiB
+4    41014       sglang::scheduler_DP0_TP4                78630MiB
+4    41015       sglang::scheduler_DP0_TP5                   43MiB
+4    41016       sglang::scheduler_DP0_TP6                   44MiB
+4    41017       sglang::scheduler_DP0_TP7                   44MiB
++-------------------------------------------------------------------+
+5    41006       python                                       1MiB
+5    41007       ...rtualenvs/sglang-0.5.6/bin/python        <1MiB
+5    41010       sglang::scheduler_DP0_TP0                   44MiB
+5    41011       sglang::scheduler_DP0_TP1                   44MiB
+5    41012       sglang::scheduler_DP0_TP2                   43MiB
+5    41013       sglang::scheduler_DP0_TP3                   44MiB
+5    41014       sglang::scheduler_DP0_TP4                   44MiB
+5    41015       sglang::scheduler_DP0_TP5                78635MiB
+5    41016       sglang::scheduler_DP0_TP6                   42MiB
+5    41017       sglang::scheduler_DP0_TP7                   44MiB
++-------------------------------------------------------------------+
+6    41006       python                                       2MiB
+6    41007       ...rtualenvs/sglang-0.5.6/bin/python         1MiB
+6    41008       sglang::data_parallel_controller            <1MiB
+6    41009       sglang::detokenizer                          2MiB
+6    41010       sglang::scheduler_DP0_TP0                   44MiB
+6    41011       sglang::scheduler_DP0_TP1                   44MiB
+6    41012       sglang::scheduler_DP0_TP2                   44MiB
+6    41013       sglang::scheduler_DP0_TP3                   44MiB
+6    41014       sglang::scheduler_DP0_TP4                   43MiB
+6    41015       sglang::scheduler_DP0_TP5                   43MiB
+6    41016       sglang::scheduler_DP0_TP6                78629MiB
+6    41017       sglang::scheduler_DP0_TP7                   44MiB
++-------------------------------------------------------------------+
+7    41006       python                                       2MiB
+7    41007       ...rtualenvs/sglang-0.5.6/bin/python         2MiB
+7    41008       sglang::data_parallel_controller             2MiB
+7    41009       sglang::detokenizer                          2MiB
+7    41010       sglang::scheduler_DP0_TP0                   44MiB
+7    41011       sglang::scheduler_DP0_TP1                   44MiB
+7    41012       sglang::scheduler_DP0_TP2                   44MiB
+7    41013       sglang::scheduler_DP0_TP3                   44MiB
+7    41014       sglang::scheduler_DP0_TP4                   44MiB
+7    41015       sglang::scheduler_DP0_TP5                   44MiB
+7    41016       sglang::scheduler_DP0_TP6                   44MiB
+7    41017       sglang::scheduler_DP0_TP7                78629MiB
+---------------------------------------------------------------------

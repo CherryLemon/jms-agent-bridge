@@ -1,0 +1,5 @@
+families.py adapted from lvyufeng/jms-top
+https://github.com/lvyufeng/jms-top
+Commit: 4c39cc4716b66c855228ed18fa5e144d7a89bed0
+License: Apache-2.0 (see LICENSE). Transport and availability policy are implemented separately.
+Local modification: Ascend board/chip mapping uses the explicit board ID in each header instead of inferring boards from missing temperature/power fields.
