@@ -236,3 +236,28 @@ not, this is the cause.
 
 Reload the client's MCP connection after changing the tool surface.
 An optional agent skill is in `examples/skills/jumpserver-access/SKILL.md`.
+
+## Live accelerator inspection
+
+Discover `jms_accelerator_status`, then call it with `targets` containing 1–8 exact
+REST asset names, IDs or unambiguous aliases. Groups, wildcards, `all`, and batches
+larger than eight are rejected before SSH. Timeout is 15–180 seconds per host.
+
+The read-only collector detects installed vendor tools rather than trusting an
+inventory platform label. NVIDIA, Ascend, MThreads, Kunlunxin, MetaX, Enflame,
+TsingMicro, T-Head, Iluvatar and Hygon adapters expose utilization, memory,
+temperature, health and process ownership where available. Follow-up PID metadata
+can identify the user, command and existing Docker container. Collection starts
+no GPU workload and installs nothing. Command-line credential fields are redacted;
+do not treat redaction as a guarantee for arbitrary application-specific secrets.
+
+Availability requires complete, valid metrics and a recognized successful process
+query: utilization below 5%, memory at most 10%, and no occupying compute process.
+Unknown, malformed, failed or shared-ownership data is never reported free.
+Results include every requested host, even when one fails, with full snapshots
+saved for `read_result(stream="result")`. A snapshot neither reserves devices nor
+authorizes stopping another process. Recheck before submitting a workload.
+
+Inspection uses the shared SSH connections and configured inspection execution
+reserve. The collector needs Python 3.9+ on the target. Parser attribution and
+license are in `src/jms_bridge/inspection_vendor/`; tests use sanitized samples.
