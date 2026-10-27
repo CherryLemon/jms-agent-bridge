@@ -1,1 +1,1 @@
-Sanitized parser samples adapted from lvyufeng/jms-top, commit 4c39cc4716b66c855228ed18fa5e144d7a89bed0. Apache-2.0; see src/jms_bridge/inspection_vendor/LICENSE. Filenames, process IDs and task paths were replaced.
+Sanitized parser samples adapted from lvyufeng/jms-top, commit 4c39cc4716b66c855228ed18fa5e144d7a89bed0. Apache-2.0; see src/jms_bridge/inspection_vendor/LICENSE. Filenames, process IDs, hardware serial numbers and task paths were replaced.
