@@ -1,9 +1,7 @@
 import hashlib
-import json
 import os
 import shutil
 import subprocess
-import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,8 +9,10 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import jsonschema
+from fs_harness import execute as execute_probe
+from fs_harness import without_rg
 
-from jms_bridge import fs_probe
+from jms_bridge import bash_fs
 from jms_bridge.config import BastionConfig
 from jms_bridge.filesystem import SCHEMA, Filesystem, remote_script, validate
 from jms_bridge.results import ResultStore
@@ -32,7 +32,7 @@ class FS(unittest.TestCase):
         (self.root / "symlink").symlink_to(self.root / "src", target_is_directory=True)
 
     def run_fs(self, action, **kwargs):
-        return fs_probe.execute(dict(action=action, path=str(self.root), **kwargs))
+        return execute_probe(dict(action=action, path=str(self.root), **kwargs))
 
     def test_list_pagination_and_tree_no_symlink_recursion(self):
         first = self.run_fs("list", limit=2)
@@ -47,16 +47,16 @@ class FS(unittest.TestCase):
         self.assertFalse(any("symlink/" in r["path"] for r in tree["entries"]))
 
     def test_stat_symlink_and_checksum(self):
-        value = fs_probe.execute(dict(action="stat", path=str(self.root / "symlink")))
+        value = execute_probe(dict(action="stat", path=str(self.root / "symlink")))
         self.assertEqual(value["type"], "symlink")
-        value = fs_probe.execute(dict(action="checksum", path=str(self.root / "config.json")))
+        value = execute_probe(dict(action="checksum", path=str(self.root / "config.json")))
         self.assertEqual(value["digest"], hashlib.sha256(b'{"a":1}\n').hexdigest())
 
     def test_read_lines_and_continuation(self):
         opts = dict(action="read", path=str(self.root / "src/a.py"), start_line=2, line_count=1)
-        value = fs_probe.execute(opts)
+        value = execute_probe(opts)
         self.assertEqual(value["text"], "needle α\n")
-        value2 = fs_probe.execute(
+        value2 = execute_probe(
             dict(action="read", path=opts["path"], byte_offset=value["next_byte_offset"])
         )
         self.assertEqual(value2["text"], "last\n")
@@ -67,7 +67,7 @@ class FS(unittest.TestCase):
         path.write_text(text)
         offset, chunks = 0, []
         while True:
-            value = fs_probe.execute(
+            value = execute_probe(
                 dict(action="read", path=str(path), byte_offset=offset, max_bytes=257)
             )
             chunks.append(value["text"])
@@ -77,11 +77,11 @@ class FS(unittest.TestCase):
         self.assertEqual("".join(chunks), text)
 
     def test_tail_partial_batch_and_binary_fifo(self):
-        value = fs_probe.execute(
+        value = execute_probe(
             dict(action="read", path=str(self.root / "src/a.py"), tail=True, line_count=2)
         )
         self.assertEqual(value["text"], "needle α\nlast\n")
-        value = fs_probe.execute(
+        value = execute_probe(
             dict(
                 action="read_many", paths=[str(self.root / "src/a.py"), str(self.root / "missing")]
             )
@@ -89,14 +89,16 @@ class FS(unittest.TestCase):
         self.assertFalse(value["ok"])
         self.assertTrue(value["files"][0]["ok"])
         (self.root / "binary").write_bytes(b"\x00\xff")
-        with self.assertRaisesRegex(ValueError, "binary"):
-            fs_probe.execute(dict(action="read", path=str(self.root / "binary")))
+        self.assertIn(
+            "binary", execute_probe(dict(action="read", path=str(self.root / "binary")))["message"]
+        )
         os.mkfifo(self.root / "fifo")
-        with self.assertRaisesRegex(ValueError, "regular"):
-            fs_probe.execute(dict(action="read", path=str(self.root / "fifo")))
+        self.assertIn(
+            "regular", execute_probe(dict(action="read", path=str(self.root / "fifo")))["message"]
+        )
 
-    def test_python_glob_search_regex_context_and_excludes(self):
-        with patch("jms_bridge.fs_probe.shutil.which", return_value=None):
+    def test_bash_glob_search_regex_context_and_excludes(self):
+        with without_rg():
             value = self.run_fs("glob", pattern="**/*.py")
             self.assertEqual(len(value["entries"]), 2)
             self.assertIn("warnings", value)
@@ -116,11 +118,11 @@ class FS(unittest.TestCase):
         path = self.root / "a-link.py"
         path.symlink_to(self.root / "src/a.py")
         opts = dict(action="search", path=str(path), pattern="needle")
-        with patch("jms_bridge.fs_probe.shutil.which", return_value=None):
-            value = fs_probe.execute(opts)
+        with without_rg():
+            value = execute_probe(opts)
             self.assertEqual(value["entries"][0]["line"], 2)
         if shutil.which("rg"):
-            value = fs_probe.execute(opts)
+            value = execute_probe(opts)
             self.assertEqual(value["entries"][0]["line"], 2)
 
     def test_rg_invalid_regex_reports_error(self):
@@ -133,10 +135,11 @@ class FS(unittest.TestCase):
     def test_read_tail_exact_boundary_and_size_limit(self):
         path = self.root / "tail"
         path.write_text("a\nb\nc\n")
-        result = fs_probe.execute(dict(action="read", path=str(path), tail=True, max_bytes=4))
+        result = execute_probe(dict(action="read", path=str(path), tail=True, max_bytes=4))
         self.assertEqual(result["text"], "b\nc\n")
-        with self.assertRaises(ValueError):
-            fs_probe.execute(dict(action="checksum", path=str(path), max_file_bytes=3))
+        self.assertFalse(
+            execute_probe(dict(action="checksum", path=str(path), max_file_bytes=3))["ok"]
+        )
 
     @unittest.skipUnless(shutil.which("rg"), "rg unavailable")
     def test_rg_glob_ignore_and_search_pages(self):
@@ -163,7 +166,12 @@ class FS(unittest.TestCase):
             ["bash", "-s"], input=script, text=True, capture_output=True, cwd=self.root, timeout=5
         )
         self.assertEqual(response.returncode, 0, response.stderr)
-        self.assertEqual(json.loads(response.stdout)["text"], "safe\n")
+        self.assertEqual(
+            bash_fs.decode(
+                response.stdout.encode(), dict(action="read", path=str(path), timeout=2)
+            )["text"],
+            "safe\n",
+        )
         self.assertFalse((self.root / "BAD").exists())
 
     def test_budget_and_bounded_scan(self):
@@ -172,23 +180,17 @@ class FS(unittest.TestCase):
         value = self.run_fs("list", max_bytes=256)
         self.assertEqual(value["returned"], 1)
         self.assertTrue(value["truncated"])
-        with patch("jms_bridge.fs_probe.SCAN_LIMIT", 10):
+        with patch("jms_bridge.bash_fs.SCAN_LIMIT", 10):
             value = self.run_fs("tree")
         self.assertTrue(value["scan_limited"])
         self.assertFalse(value["complete"])
 
-    def test_regex_timeout_is_structured_not_hung(self):
-        (self.root / "slow").write_text("a" * 100000 + "!")
-        # Force the stdlib engine in a separate interpreter, preserving the helper timeout.
-        source = Path(fs_probe.__file__).read_text()
-        opts = dict(
-            action="search", path=str(self.root), pattern="(a+)+$", literal=False, timeout=1
-        )
-        code = source + "\nshutil.which = lambda _: None\nmain(" + repr(opts) + ")"
-        proc = subprocess.run(
-            [sys.executable, "-I", "-S", "-c", code], capture_output=True, text=True, timeout=4
-        )
-        value = json.loads(proc.stdout)
+    def test_utility_timeout_is_structured_not_hung(self):
+        with without_rg() as commands:
+            (commands / "grep").unlink()
+            (commands / "grep").write_text("#!/bin/bash\nsleep 5\n")
+            (commands / "grep").chmod(0o755)
+            value = self.run_fs("search", pattern="needle", timeout=1)
         self.assertTrue(value["timed_out"])
         self.assertFalse(value["complete"])
 
@@ -325,7 +327,16 @@ class Integration(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as td:
             store = ResultStore(Path(td) / "results")
             rid = store.create()
-            store.path(rid, "stdout").write_text('{"ok":true,"text":"hello"}')
+            sample = Path(td) / "sample"
+            sample.write_text("hello")
+            wire = subprocess.run(
+                ["bash", "-s"],
+                input=remote_script(dict(action="read", path=str(sample))).encode(),
+                capture_output=True,
+                check=True,
+            )
+            store.path(rid, "stdout").write_bytes(wire.stdout)
+            store.path(rid, "stderr").write_bytes(wire.stderr)
             store.finish(rid)
             host = SimpleNamespace(name="one")
             catalog = SimpleNamespace(

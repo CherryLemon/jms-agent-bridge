@@ -1,4 +1,4 @@
-"""Private reusable shell channels; each filesystem probe is a fresh Python process."""
+"""Private reusable shell channels; each filesystem probe is a fresh Bash process."""
 
 import asyncio
 import time

@@ -15,6 +15,8 @@ Client-specific prefixes may differ.
   `checksum`, `upload` and `download`. Discover `jms_fs` for its schema. Paths and
   patterns are data; no shell quoting is needed. Use `read_many` for several
   known files, byte cursors for text and row offsets for search/directory pages.
+  Exploration uses Bash 4.2+ and GNU tools on the target, without target Python.
+  Search prefers rg; without it, GNU grep uses POSIX ERE and reports missing ignore rules.
   An optional existing `container` changes the remote view. Upload/download write
   their destination; `local_path` refers to the MCP server machine. Reconcile
   transfers with the original `request_id` after a lost reply.
