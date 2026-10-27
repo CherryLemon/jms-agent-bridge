@@ -19,6 +19,10 @@ SCAN_BYTES = 64 * 1024 * 1024
 DEFAULT_BYTES = 4096
 
 
+def strip_dot_prefix(path):
+    return path[2:] if path.startswith("./") else path
+
+
 def error(exc, path=None):
     return dict(
         ok=False, error=type(exc).__name__, message=str(exc), **({"path": path} if path else {})
@@ -253,7 +257,7 @@ def rg_rows(path, options, state, glob=False):
                     parts = (pending + chunk).split(b"\0")
                     pending = parts.pop()
                     for part in parts:
-                        rel = os.fsdecode(part).removeprefix("./")
+                        rel = strip_dot_prefix(os.fsdecode(part))
                         if not matches(rel, [options["pattern"]]) or (
                             options.get("include") and not matches(rel, options["include"])
                         ):
@@ -285,7 +289,7 @@ def rg_rows(path, options, state, glob=False):
                             else base64.b64decode(value["bytes"]).decode("utf-8", "replace")
                         )
 
-                    rel = decode(data["path"]).removeprefix("./")
+                    rel = strip_dot_prefix(decode(data["path"]))
                     if options.get("include") and not matches(rel, options["include"]):
                         continue
                     text = decode(data["lines"]).rstrip("\r\n")
@@ -324,7 +328,7 @@ def python_search(path, options, state):
     rows = (
         walk(path, options, state)
         if os.path.isdir(path)
-        else iter([info(path) | {"relative_path": os.path.basename(path), "type": "file"}])
+        else iter([dict(info(path), relative_path=os.path.basename(path), type="file")])
     )
     for row in rows:
         if row["type"] != "file" or (
@@ -359,12 +363,12 @@ def python_search(path, options, state):
                     if hit:
                         for previous in before:
                             if previous["line"] > last_emitted:
-                                yield previous | {"kind": "context"}
-                        yield current | {"kind": "match"}
+                                yield dict(previous, kind="context")
+                        yield dict(current, kind="match")
                         last_emitted = number
                         after_until = number + options.get("context_lines", 0)
                     elif number <= after_until:
-                        yield current | {"kind": "context"}
+                        yield dict(current, kind="context")
                         last_emitted = number
                     before.append(current)
         except TimeoutError:
@@ -489,7 +493,7 @@ def execute(options):
             )
         else:
             rows = python_search(path, options, state)
-    return page(rows, options, state) | {"path": path, "action": action}
+    return dict(page(rows, options, state), path=path, action=action)
 
 
 def main(options):
