@@ -1,6 +1,6 @@
 # Compact resident service
 
-`jms-bridge serve --compact` exposes four tools and keeps SSH connections inside
+`jms-bridge serve --compact` exposes five tools and keeps SSH connections inside
 its process. The existing `serve`, `doctor`, `probe`, and YAML-based workflows
 remain available. Compact mode is opt-in and requires Python 3.10+ on a POSIX
 host, Bash on target assets, and rsync on both ends for file synchronization.
@@ -62,6 +62,7 @@ version control. Restart the service after changing its connection configuration
 
 | Tool | Purpose |
 | --- | --- |
+| `fs` | Structured remote file exploration and upload/download; optional existing Docker container. |
 | `run` | Execute literal Bash or a local script file, optionally in remote Docker. |
 | `read_result` | Read stored stdout/stderr/JSON by byte cursor, tail, or literal search. |
 | `discover` | Search permitted assets, inspect status, or disclose operation schemas. |
@@ -263,3 +264,5 @@ authorizes stopping another process. Recheck before submitting a workload.
 Inspection uses the shared SSH connections and configured inspection execution
 reserve. The collector needs Python 3.9+ on the target. Parser attribution and
 license are in `src/jms_bridge/inspection_vendor/`; tests use sanitized samples.
+
+See [structured filesystem operations](filesystem.md) for action options, paging, transfer semantics and automatic channel reuse. When the client and target share storage, prefer a verified local/remote path mapping over redundant transfers; mappings must be supplied by the deployment.
