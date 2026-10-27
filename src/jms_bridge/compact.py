@@ -4,13 +4,15 @@ import asyncio
 import contextvars
 import json
 import logging
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Literal
 
+import jsonschema
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
-from mcp.types import ToolAnnotations
+from mcp.types import CallToolResult, ToolAnnotations
 from pydantic import Field
 
 from . import __version__
@@ -18,7 +20,7 @@ from . import server as upstream
 from .accelerator_inspection import OPERATION as INSPECT_OPERATION
 from .accelerator_inspection import SCHEMA as INSPECT_SCHEMA
 from .accelerator_inspection import AcceleratorInspector
-from .async_io import offload
+from .async_io import io_metrics, offload
 from .comment_guard import check as check_script_guard
 from .config import ConfigError, load_config
 from .filesystem import OPERATION as FS_OPERATION
@@ -64,28 +66,88 @@ DANGEROUS_FLAG_DESCRIPTION = (
     "or record approval, or override Codex automatic review, OS permissions, or JumpServer "
     "policy. Do not use it to retry an external approval denial."
 )
-INSTRUCTIONS = """JumpServer access through five tools: run, fs, read_result, discover, call.
-After a lost reply, query request_status with the original request_id; never blindly replay.
-Saved outputs expire after a configurable TTL (default 7 days); receipts remain for deduplication.
-allow_dangerous acknowledges only the local pattern guard for an already-authorized command;
-it grants no approval and cannot override client, OS or JumpServer denial.
-Use run for literal Bash or a local script_path;
-container/image selects remote Docker without nested shell quoting. SSH connections belong to this
-service. Each run is isolated unless session_id is explicitly supplied. The same session_id on the
-same asset retains cd/export/functions; use distinct IDs for unrelated tasks. Never replay a
-timed-out
-command automatically. Idle connections reconnect automatically; before script transmission a
-transport failure can retry once. After transmission a failure returns completion_unknown=true and
-must not be replayed blindly. Lost named shells require a new ID or explicit session_close reset.
-Long/background work belongs to the job operations discovered below.
-Output is saved completely to a private result store; use read_result(result_id, stream,
-offset/limit,
-tail or pattern) for more. Default previews share a 4096-byte budget across targets.
-Use discover(topic="assets", query="...") for REST-authorized target names/IDs, refreshed hourly.
-Use discover(query="jobs") for matching operation names, then discover(operation="jms_submit_job")
-for that operation's schema. Invoke low-frequency operations with call(operation, arguments).
-An inventory snapshot is not a hardware health check; unknown accelerator platform stays generic.
-"""
+INSTRUCTIONS = """JumpServer: run, fs, read_result, discover, call. Use REST-authorized targets.
+After a lost reply, query request_status with the original request_id; never blindly replay
+uncertain work. allow_dangerous acknowledges only the local guard for an already-authorized
+action; it grants no approval and cannot override client/JumpServer denial.
+Saved outputs expire by TTL (default 7 days, hourly cleanup); reads do not extend it.
+Active results are protected; deduplication receipts are retained separately."""
+
+
+class CompactMCPServer(MCPServer):
+    """Minify the SDK's JSON text view without changing structured data or storage."""
+
+    async def call_tool(self, name, arguments, context=None):
+        started = time.monotonic()
+        metrics = {}
+        token = io_metrics.set(metrics)
+        error, result = None, None
+        try:
+            result = await self.compact_call(name, arguments, context)
+            return result
+        except BaseException as exc:
+            error = type(exc).__name__
+            raise
+        finally:
+            io_metrics.reset(token)
+            logging.getLogger("jms_bridge.performance").info(
+                "%s",
+                json.dumps(
+                    dict(
+                        event="tool_finished",
+                        at=time.time(),
+                        tool=name,
+                        operation=str(
+                            (arguments or {}).get("operation")
+                            or (arguments or {}).get("action")
+                            or ""
+                        )[:80],
+                        tool_handler_seconds=round(time.monotonic() - started, 6),
+                        response_bytes=sum(
+                            len(c.text.encode()) for c in result.content if c.type == "text"
+                        )
+                        if isinstance(result, CallToolResult)
+                        else 0,
+                        error_type=error,
+                        **{k: round(v, 6) for k, v in metrics.items()},
+                    ),
+                    separators=(",", ":"),
+                ),
+            )
+
+    async def compact_call(self, name, arguments, context=None):
+        result = await super().call_tool(name, arguments, context)
+        if (
+            name in {"run", "fs", "read_result", "discover", "call"}
+            and isinstance(result, CallToolResult)
+            and not result.is_error
+            and len(result.content) == 1
+            and result.content[0].type == "text"
+        ):
+            block = result.content[0]
+            serialization_started = time.monotonic()
+            try:
+                # These five tools return dicts. This SDK also emits JSON text when
+                # structured_content is absent. Preserve either structured view as-is.
+                text = json.dumps(json.loads(block.text), ensure_ascii=False, separators=(",", ":"))
+            except (ValueError, TypeError):
+                return result
+            finally:
+                metrics = io_metrics.get()
+                if metrics is not None:
+                    metrics["compaction_seconds"] = time.monotonic() - serialization_started
+            result = result.model_copy(
+                update={"content": [block.model_copy(update={"text": text})]}
+            )
+        return result
+
+
+def validate_cached(validator, arguments):
+    # Keep jsonschema.validate's best-match error choice, without rebuilding the
+    # validator and checking its trusted static schema for every request.
+    error = jsonschema.exceptions.best_match(validator.iter_errors(arguments))
+    if error is not None:
+        raise error
 
 
 def unwrap(result):
@@ -121,6 +183,10 @@ class BridgeService:
         self.inspector = AcceleratorInspector(self.catalog, self.runner, self.store)
         self.manager = RecoverableJobManager(self.runner, self.record_submission)
         self.schemas = {}
+        self.validators = {}
+        self.fs_validator = jsonschema.validators.validator_for(FS_SCHEMA["inputSchema"])(
+            FS_SCHEMA["inputSchema"]
+        )
 
         @asynccontextmanager
         async def lifespan(server):
@@ -136,7 +202,7 @@ class BridgeService:
                     await self.catalog.close()
                     await self.runner.close()
 
-        self.server = MCPServer(
+        self.server = CompactMCPServer(
             "jms-agent-bridge", version=__version__, instructions=INSTRUCTIONS, lifespan=lifespan
         )
         self.register()
@@ -268,6 +334,11 @@ class BridgeService:
                     "destructiveHint": name == "session_close",
                 },
             }
+
+        self.validators = {
+            name: jsonschema.validators.validator_for(schema["inputSchema"])(schema["inputSchema"])
+            for name, schema in self.schemas.items()
+        }
 
     async def run(
         self,
@@ -477,9 +548,8 @@ class BridgeService:
         if operation not in self.schemas:
             raise ValueError("unknown operation; discover its schema first")
         # Validate the hidden operation with its real schema before any side effect.
-        import jsonschema
 
-        jsonschema.validate(arguments, self.schemas[operation]["inputSchema"])
+        validate_cached(self.validators[operation], arguments)
         if request_id is not None:
             if operation != "jms_submit_job":
                 raise ValueError("call request_id currently supports only jms_submit_job")
@@ -588,9 +658,7 @@ class BridgeService:
 
     async def fs(self, arguments, *, _validated=False):
         if not _validated:
-            import jsonschema
-
-            jsonschema.validate(arguments, FS_SCHEMA["inputSchema"])
+            validate_cached(self.fs_validator, arguments)
         validate_fs(arguments)
         args = dict(arguments)
         request_id = args.pop("request_id", None)
@@ -655,13 +723,15 @@ class BridgeService:
             timeout: int | None = None,
         ) -> dict:
             """Explore files or transfer them on one exact REST asset; optional existing container.
-            Absolute paths/patterns are data, not shell. Exploration actions are read-only;
-            upload/download write destinations. local_path is on this MCP machine;
-            path is remote. overwrite=false skips existing files (directory metadata may sync);
-            extras are never deleted. Set request_id for transfers; recover via request_status.
-            Bounded pages: read uses byte_offset; list/glob/search/tree use offset/limit.
-            Search defaults literal, case-sensitive. result_id saves this page, not unseen pages.
-            discover(operation='jms_fs') provides action-specific options, defaults and limits."""
+            Absolute paths/patterns are data, not shell.
+            read/list/stat/read_many/glob/search/tree/checksum are read-only; upload/download
+            write destinations. local_path is on this MCP machine; path is remote.
+            overwrite=false skips existing files (directory metadata may sync); extras are never
+            deleted. Set request_id for transfers; recover via request_status. Bounded pages:
+            read uses byte_offset; list/glob/search/tree use offset/limit. Search defaults
+            literal, case-sensitive. result_id saves this page, not unseen pages.
+            discover(operation='jms_fs') provides action-specific options, defaults and limits.
+            """
             import jsonschema
 
             arguments = dict(
@@ -721,12 +791,16 @@ class BridgeService:
             allow_dangerous: Annotated[bool, Field(description=DANGEROUS_FLAG_DESCRIPTION)] = False,
             request_id: str | None = None,
         ) -> dict:
-            """Run literal Bash or a local script file; optional remote Docker.
-            Complete stdout/stderr are saved; read_result fetches more. Default runs are isolated.
-            Explicit session_id retains shell state on each target. Timeout 1..600s; longer work
-            uses job operations. request_id provides durable response-loss recovery.
-            allow_dangerous acknowledges only the local guard for an already-authorized command;
-            it never grants approval or overrides a client or JumpServer denial.
+            """Run literal Bash or absolute local script_path on REST assets. container/image
+            selects Docker without nested quoting; cwd/env/docker_args apply there. Isolated
+            by default; task session_id retains cd/env/functions per asset. Lost shells need a
+            new ID or session_close. Idle SSH reconnects; channel opening retries only before
+            transmission. completion_unknown/timeout must never trigger blind replay.
+            queue_timed_out with not_started means unsent. Set request_id before work;
+            reconcile request_status after reply loss. Timeout 1..600s; use jobs for background
+            work. Full stdout/stderr are saved; previews share max_output_bytes across targets
+            (default4096), read_result fetches more. allow_dangerous acknowledges the local guard
+            for an already-authorized action.
             """
             try:
                 return await self.run(
@@ -758,8 +832,8 @@ class BridgeService:
             tail: bool = False,
             pattern: str | None = None,
         ) -> dict:
-            """Read saved output by byte offset, tail, or literal pattern.
-            Limit <=16384; continue with next_offset.
+            """Read saved output by byte offset (limit <=16384), tail, or literal pattern; continue
+            with next_offset.
             """
             try:
                 return await offload(
@@ -778,8 +852,11 @@ class BridgeService:
             limit: int = 10,
             offset: int = 0,
         ) -> dict:
-            """Find assets or operations; an exact operation returns its schema.
-            No query lists categories.
+            """topic=assets searches hourly REST targets; status shows service/SSH health and work
+            queues. Inventory is not hardware health:
+            discover(operation='jms_accelerator_status') for live GPU/NPU occupancy on 1-8
+            explicit hosts; unknown is not free. query finds operation names or categories (e.g.
+            jobs); operation returns one full schema; no query lists categories.
             """
             try:
                 return await self.discover(query, operation, topic, limit, offset)
@@ -790,8 +867,9 @@ class BridgeService:
             name="call", annotations=ToolAnnotations(destructiveHint=True, openWorldHint=True)
         )
         async def call(operation: str, arguments: dict, request_id: str | None = None) -> dict:
-            """Invoke an operation after discovering its schema.
-            Read the full saved response with read_result(stream='result').
+            """Invoke an operation disclosed by discover. Top-level request_id supports only
+            jms_submit_job: set it before submission, then use request_status after a lost reply.
+            Full responses: read_result(stream='result').
             """
             import jsonschema
 

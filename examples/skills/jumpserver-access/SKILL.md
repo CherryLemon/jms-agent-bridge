@@ -46,6 +46,10 @@ Client-specific prefixes may differ.
   script transmission. A failure after transmission is never replayed automatically.
   If `completion_unknown=true`, inspect saved output and remote state before
   deciding whether to repeat a command. `executed=null` means even its start is uncertain.
+- A temporary client transport error or missing tool schema is not proof that
+  the remote operation failed. Refresh the MCP connection/discovery and retry
+  read-only checks with bounded backoff. Keep tracking accepted work; reconcile
+  mutations by their original request ID before making another submission.
 - A lost named shell is reported explicitly, including after a service restart.
   Use a new ID and reapply setup, or explicitly close/reset the previous ID. Do not
   assume reconnecting restores shell state. Avoid changing the shell's standard
