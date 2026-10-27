@@ -139,6 +139,8 @@ An explicit `session_id` retains a Bash shell's directory, exports, functions, a
 options on each target, with calls serialized per shell. Named shells use normal
 Bash error behavior unless the script changes it. Container/image options are
 bound to that session; use a different ID to change them.
+Concurrent calls are serialized when they reach the shell; await dependent calls
+explicitly rather than assuming parallel requests execute in submission order.
 
 `container` uses `docker exec -i`; `image` creates a `docker run --rm -i` container
 with Bash as the entrypoint. `cwd` and `env` apply inside it. `docker_args` holds
