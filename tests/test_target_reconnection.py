@@ -23,6 +23,7 @@ class TrackedConnection(LocalConnection):
     closed = False
     fail_startup = False
     delay_transfer = False
+    transfer_release = None
 
     def is_closed(self):
         return self.closed
@@ -34,7 +35,18 @@ class TrackedConnection(LocalConnection):
     async def create_process(self, command, **kwargs):
         if self.fail_startup and "--noprofile" in command:
             command = "sleep 0.01"
-        if self.delay_transfer and command.startswith("rsync "):
+        if self.transfer_release and command.startswith("rsync "):
+            command = shlex.join(
+                [
+                    "bash",
+                    "-c",
+                    'while [[ ! -e "$1" ]]; do sleep 0.01; done; shift; exec "$@"',
+                    "bash",
+                    str(self.transfer_release),
+                    *shlex.split(command),
+                ]
+            )
+        elif self.delay_transfer and command.startswith("rsync "):
             command = shlex.join(
                 ["bash", "-c", 'sleep 0.15; exec "$@"', "bash", *shlex.split(command)]
             )
@@ -103,6 +115,15 @@ class TargetRecovery(unittest.IsolatedAsyncioTestCase):
 
         await asyncio.wait_for(waiting(), 2)
 
+    async def wait_draining(self):
+        async def waiting():
+            while (
+                self.runner._connection_recovery.state(self.runner.key(self.a)).phase != "draining"
+            ):
+                await asyncio.sleep(0.001)
+
+        await asyncio.wait_for(waiting(), 2)
+
     async def test_two_failed_channels_replace_only_target_connection(self):
         self.old.fail_startup = True
         result = await self.query()
@@ -115,17 +136,24 @@ class TargetRecovery(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.runner._connection_recovery.resets, 1)
 
     async def test_same_host_command_finishes_and_other_host_keeps_running(self):
+        release = self.root / "release-command"
         active = asyncio.create_task(
-            self.runner.execute_to_store(self.a, "sleep 0.2; printf ORIGINAL_FINISHED", 2)
+            self.runner.execute_to_store(
+                self.a,
+                "while [[ ! -e "
+                + shlex.quote(str(release))
+                + " ]]; do sleep 0.01; done; printf ORIGINAL_FINISHED",
+                4,
+            )
         )
         await self.wait_active(self.a)
         self.old.fail_startup = True
         query = asyncio.create_task(self.query())
-        while self.runner._connection_recovery.state(self.runner.key(self.a)).phase != "draining":
-            await asyncio.sleep(0.001)
+        await self.wait_draining()
         other = await self.runner.execute_to_store(self.b, "printf OTHER_FINISHED", 2)
         self.assertTrue(other["ok"])
         self.assertFalse(self.old.closed)
+        release.touch()
         original = await active
         self.assertTrue(original["ok"])
         self.assertEqual(
@@ -136,13 +164,19 @@ class TargetRecovery(unittest.IsolatedAsyncioTestCase):
 
     async def test_same_host_rsync_completes_before_connection_is_closed(self):
         destination = self.root / "downloaded file"
-        self.old.delay_transfer = True
+        release = self.root / "release-transfer"
+        self.old.transfer_release = release
         transfer = asyncio.create_task(
             self.runner.rsync(self.a, str(destination), str(self.path), direction="pull")
         )
         await self.wait_active(self.a)
         self.old.fail_startup = True
-        result = await self.query()
+        query = asyncio.create_task(self.query())
+        await self.wait_draining()
+        self.assertFalse(self.old.closed)
+        self.assertFalse(transfer.done())
+        release.touch()
+        result = await query
         receipt = await transfer
         self.assertTrue(self.store.metadata(receipt.result_id)["ok"])
         self.assertEqual(destination.read_bytes(), self.path.read_bytes())
