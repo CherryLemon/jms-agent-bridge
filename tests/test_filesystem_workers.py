@@ -158,6 +158,7 @@ class Workers(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.fs.workers.status()["startup_retries"], 1)
 
     async def test_repeated_startup_eof_is_bounded_and_never_completion_unknown(self):
+        self.runner.recover_connection = AsyncMock(return_value=dict(status="failed"))
         await self.install_startup_failure(2)
         result = await self.fs.execute(target="x", action="list", path=str(self.root))
         self.assertFalse(result["ok"])
@@ -187,7 +188,8 @@ class Workers(unittest.IsolatedAsyncioTestCase):
 
     async def test_saturated_pool_fallback_also_confirms_startup_before_script(self):
         self.fs.workers.limit = 0
-        writes = await self.install_startup_failure(1)
+        self.runner.recover_connection = AsyncMock(return_value=dict(status="failed"))
+        writes = await self.install_startup_failure(2)
         result = await self.fs.workers.execute(self.host, "printf secret_query", 1)
         self.assertFalse(result["ok"])
         self.assertFalse(result["completion_unknown"])

@@ -355,6 +355,7 @@ class Filesystem:
                     "warning",
                     "failure_stage",
                     "startup_retry_result_id",
+                    "connection_recovery",
                 )
             } | await offload(self.store.preview, rid, 2048)
         path = self.store.path(rid, "stdout")
@@ -386,6 +387,8 @@ class Filesystem:
         )
         if "startup_retry_result_id" in meta:
             result["startup_retry_result_id"] = meta["startup_retry_result_id"]
+        if "connection_recovery" in meta:
+            result["connection_recovery"] = meta["connection_recovery"]
         # Keep the native response usable JSON even when content is large.
         # max_bytes bounds content; rows/metadata can add modest overhead.
         return result | {"data": value}

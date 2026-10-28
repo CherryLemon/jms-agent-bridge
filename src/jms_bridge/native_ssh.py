@@ -18,6 +18,7 @@ import asyncssh
 
 from .async_io import offload
 from .config import ConfigError
+from .connection_recovery import ConnectionRecovery, connection_operation
 from .results import atomic_json
 from .scheduling import ExecutionSlots, QueueTimeout, Timings
 from .ssh import ExecResult
@@ -181,6 +182,7 @@ class NativeSSHRunner:
         self._session_gates = {}
         self._connect_lock = asyncio.Lock()
         self._connections = {}
+        self._connection_recovery = ConnectionRecovery()
         self._shells = {}
         self._shells_lock = asyncio.Lock()
         self._last_login = 0.0
@@ -264,6 +266,7 @@ class NativeSSHRunner:
         return {
             "connected": sum(not c.is_closed() for c in self._connections.values()),
             "disconnected": sum(c.is_closed() for c in self._connections.values()),
+            "recovery": self._connection_recovery.status(),
         }
 
     def key(self, host):
@@ -272,8 +275,47 @@ class NativeSSHRunner:
         return (host.login, host.account, str(uuid.UUID(host.asset_id)))
 
     async def connection(self, host):
+        with self.phase("queue_seconds"):
+            await self._connection_recovery.enter(self.key(host), self.queue_timeout)
         with self.phase("connection_seconds"):
-            return await self._connection(host)
+            connection = await self._connection(host)
+            self._connection_recovery.bind(self.key(host), connection)
+            return connection
+
+    def connection_use(self, host):
+        return self._connection_recovery.use(self.key(host))
+
+    def protected_shells(self, host):
+        key = self.key(host)
+        return any(
+            target == key
+            and not sid.startswith("_fs:")
+            and not shell.lost
+            and not shell.process.is_closing()
+            for (target, sid), shell in self._shells.items()
+        )
+
+    async def recover_connection(self, host, generation):
+        async def replace():
+            # The per-target gate is closed and all operation leases are gone.
+            # Only idle private workers may remain; user shell state is protected.
+            key = self.key(host)
+            for target, sid in list(self._shells):
+                if target == key and sid.startswith("_fs:"):
+                    await self.close_session(host, sid, _internal=True)
+            connection = self._connections.pop(key, None)
+            if connection:
+                connection.close()
+                await asyncio.wait_for(connection.wait_closed(), 5)
+            await self.connection(host)
+
+        return await self._connection_recovery.request(
+            self.key(host),
+            generation,
+            replace,
+            lambda: self.protected_shells(host),
+            wait_seconds=self.queue_timeout,
+        )
 
     def connection_phase(self, name):
         timing = self._timings_context.get()
@@ -375,6 +417,7 @@ class NativeSSHRunner:
             raise ValueError("docker_args requires container or image")
         return shlex.join(shell)
 
+    @connection_operation
     async def execute_to_store(
         self,
         host,
@@ -713,6 +756,7 @@ class NativeSSHRunner:
                 timing=timing.snapshot(),
                 queue_timed_out=queue_timed_out,
                 connection_timing=timing.connection_snapshot(),
+                connection_generation=self._connection_recovery.generation(self.key(host)),
                 failure_stage=failure_stage if warning else None,
             )
             self.performance_log(meta)
@@ -771,6 +815,7 @@ class NativeSSHRunner:
                 await offload(self.save_sessions)
             if _internal:
                 self._session_gates.pop(key, None)
+            self._connection_recovery.notify(self.key(host))
         return {"ok": True, "closed": existed}
 
     def sessions(self):
@@ -786,6 +831,7 @@ class NativeSSHRunner:
         ]
 
     async def close(self):
+        await self._connection_recovery.close()
         for shell in self._shells.values():
             shell.process.close()
         for connection in self._connections.values():
@@ -796,6 +842,7 @@ class NativeSSHRunner:
         self._shells.clear()
         self._connections.clear()
 
+    @connection_operation
     async def rsync(
         self,
         host,
