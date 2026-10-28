@@ -34,6 +34,56 @@ def connection_operation(method):
     return wrapped
 
 
+def startup_failed(result):
+    """Only a pre-transmission readiness failure is safe to retry."""
+    return (
+        result.get("failure_stage") == "shell_startup"
+        and result.get("execution_state") == "not_started"
+        and not result.get("completion_unknown")
+        and not result.get("timed_out")
+        and result.get("exit_code") == 75
+    )
+
+
+async def recover_startup(runner, host, attempt, *, on_retry=None):
+    first = await attempt()
+    if not startup_failed(first):
+        return first
+    if on_retry:
+        on_retry()
+    result = await attempt()
+    if startup_failed(result):
+        recovery = await runner.recover_connection(host, result.get("connection_generation"))
+        if recovery["status"] in ("reset", "already_replaced"):
+            previous = result["result_id"]
+            result = await attempt()
+            result = dict(result, connection_recovery=dict(recovery, previous_result_id=previous))
+        else:
+            result = dict(result, connection_recovery=recovery)
+    return dict(result, startup_retry_result_id=first["result_id"])
+
+
+def recover_isolated_startup(method):
+    """Run outside the per-attempt lease so recovery can safely drain it."""
+
+    @functools.wraps(method)
+    async def wrapped(self, host, *args, **kwargs):
+        if (
+            kwargs.get("session_id")
+            or kwargs.get("image")
+            or kwargs.get("_startup_probe")
+            or kwargs.get("_internal_session")
+        ):
+            return await method(self, host, *args, **kwargs)
+
+        async def attempt():
+            return await method(self, host, *args, **kwargs)
+
+        return await recover_startup(self, host, attempt)
+
+    return wrapped
+
+
 class ConnectionRecovery:
     def __init__(self, *, cooldown_seconds=60):
         self.targets = {}

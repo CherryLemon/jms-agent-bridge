@@ -18,7 +18,11 @@ import asyncssh
 
 from .async_io import offload
 from .config import ConfigError
-from .connection_recovery import ConnectionRecovery, connection_operation
+from .connection_recovery import (
+    ConnectionRecovery,
+    connection_operation,
+    recover_isolated_startup,
+)
 from .results import atomic_json
 from .scheduling import ExecutionSlots, QueueTimeout, Timings
 from .ssh import ExecResult
@@ -88,11 +92,13 @@ class ShellSession:
         self.started = False
         self.buffers = {"stdout": b"", "stderr": b""}
         self.ready = False
+        self.startup_output = {"stdout": b"", "stderr": b""}
 
     async def prime(self, timeout):
-        """Confirm both streams before transmitting a private filesystem script."""
+        """Confirm both streams before transmitting any script."""
         nonce = uuid.uuid4().hex
         marker = b"\x1eREADY" + nonce.encode() + b"\x1f"
+        self.ready_marker = marker
 
         async def acknowledge(stream):
             buffer = self.buffers[stream]
@@ -105,10 +111,11 @@ class ShellSession:
                 chunk = await getattr(self.process, stream).read(65536)
                 if not chunk:
                     raise ConnectionError(
-                        "remote shell closed during startup; filesystem script was not sent. "
+                        "remote shell closed during startup; script was not sent. "
                         "SSH authentication alone does not confirm remote execution is available; "
                         "check the gateway execution policy and target connection"
                     )
+                self.startup_output[stream] = (self.startup_output[stream] + chunk)[-2048:]
                 buffer += chunk
 
         async def exchange():
@@ -126,8 +133,26 @@ class ShellSession:
                         task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
 
-        await asyncio.wait_for(exchange(), timeout)
+        try:
+            await asyncio.wait_for(exchange(), timeout)
+        except ConnectionError:
+            # Preserve a bounded gateway error even if one stream closed before
+            # the other readiness reader had a chance to collect it.
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(self.process.wait_closed(), 0.5)
+            for stream in ("stdout", "stderr"):
+                with contextlib.suppress(Exception):
+                    chunk = await asyncio.wait_for(getattr(self.process, stream).read(2048), 0.1)
+                    self.startup_output[stream] = (self.startup_output[stream] + chunk)[-2048:]
+            raise
         self.ready = True
+
+    def save_startup_output(self, paths):
+        for stream, data in self.startup_output.items():
+            data = data.replace(getattr(self, "ready_marker", b"__UNSET__"), b"")
+            if data:
+                with open_output(paths[stream]) as output:
+                    output.write(data)
 
     async def capture(self, stream, path, start, end):
         reader = getattr(self.process, stream)
@@ -417,6 +442,7 @@ class NativeSSHRunner:
             raise ValueError("docker_args requires container or image")
         return shlex.join(shell)
 
+    @recover_isolated_startup
     @connection_operation
     async def execute_to_store(
         self,
@@ -579,12 +605,13 @@ class NativeSSHRunner:
                             "session state was lost; "
                             "use a new session_id or call session_close to reset it"
                         )
-                    if _internal_session and not shell.ready:
+                    if not shell.ready:
                         failure_stage = "shell_startup"
                         try:
                             with timing.phase("channel_seconds"):
                                 await shell.prime(min(timeout, 10))
                         except BaseException:
+                            shell.save_startup_output(paths)
                             shell.lost = True
                             shell.process.close()
                             raise
@@ -630,16 +657,17 @@ class NativeSSHRunner:
                     marker = ("__JMS_EXEC_" + uuid.uuid4().hex + "__\n").encode()
                     process, channel_reconnected = await self.open_process(host, command)
                     reconnected = reconnected or channel_reconnected
-                    if _startup_probe:
-                        failure_stage = "shell_startup"
-                        try:
-                            with timing.phase("channel_seconds"):
-                                await ShellSession(process, ()).prime(min(timeout, 10))
-                        except BaseException:
-                            process.close()
-                            with contextlib.suppress(Exception):
-                                await asyncio.wait_for(process.wait_closed(), 5)
-                            raise
+                    failure_stage = "shell_startup"
+                    startup = ShellSession(process, ())
+                    try:
+                        with timing.phase("channel_seconds"):
+                            await startup.prime(min(timeout, 10))
+                    except BaseException:
+                        startup.save_startup_output(paths)
+                        process.close()
+                        with contextlib.suppress(Exception):
+                            await asyncio.wait_for(process.wait_closed(), 5)
+                        raise
                     tasks = [
                         asyncio.create_task(
                             pump(process.stdout, paths["stdout"], marker, progress)
@@ -660,7 +688,11 @@ class NativeSSHRunner:
                         await asyncio.wait_for(process.wait_closed(), timeout)
                         await asyncio.gather(*tasks)
                         executed = progress["started"]
-                        completed = process.exit_status is not None and process.exit_status >= 0
+                        completed = (
+                            executed
+                            and process.exit_status is not None
+                            and process.exit_status >= 0
+                        )
                     except BaseException:
                         process.close()
                         with contextlib.suppress(Exception):
@@ -675,7 +707,14 @@ class NativeSSHRunner:
                     code = process.exit_status if process.exit_status is not None else 255
                     if not executed and code == 0:
                         code = 75
-                    if not completed:
+                    if not executed:
+                        failure_stage = "execution_ack"
+                        warning = (
+                            "SSH channel ended without the script start acknowledgment after "
+                            "transmission; remote completion is unknown; "
+                            "do not replay automatically."
+                        )
+                    elif not completed:
                         warning = (
                             "SSH channel ended without a completion status; "
                             "remote completion is unknown."

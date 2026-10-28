@@ -4,6 +4,8 @@ import asyncio
 import time
 import uuid
 
+from .connection_recovery import recover_startup
+
 
 class FilesystemWorkers:
     def __init__(self, runner, *, limit=16, per_target=2, idle_seconds=300):
@@ -52,16 +54,16 @@ class FilesystemWorkers:
             await asyncio.sleep(min(30, self.idle_seconds))
             await self.sweep()
 
-    async def execute(
-        self,
-        host,
-        script,
-        timeout,
-        *,
-        container=None,
-        _startup_retried=False,
-        _connection_retried=False,
-    ):
+    async def execute(self, host, script, timeout, *, container=None):
+        async def attempt():
+            return await self._execute_once(host, script, timeout, container=container)
+
+        def retried():
+            self.startup_retries += 1
+
+        return await recover_startup(self.runner, host, attempt, on_retry=retried)
+
+    async def _execute_once(self, host, script, timeout, *, container=None):
         if self.sweeper is None:
             self.sweeper = asyncio.create_task(self.loop(), name="jms-fs-worker-cleanup")
         key = (self.runner.key(host), container)
@@ -119,45 +121,6 @@ class FilesystemWorkers:
                             self.entries.remove(entry)
                     else:
                         entry.update(busy=False, last_used=time.monotonic())
-        # Only the readiness probe was sent. No filesystem script can have run,
-        # so one fresh private channel is safe. Never replay after transmission,
-        # a timeout/cancellation, an authorization error, or an unknown completion.
-        if (
-            result.get("failure_stage") == "shell_startup"
-            and result.get("execution_state") == "not_started"
-            and not result.get("completion_unknown")
-            and not result.get("timed_out")
-            and result.get("exit_code") == 75
-        ):
-            if not _startup_retried:
-                self.startup_retries += 1
-                retried = await self.execute(
-                    host,
-                    script,
-                    timeout,
-                    container=container,
-                    _startup_retried=True,
-                    _connection_retried=_connection_retried,
-                )
-                return dict(retried, startup_retry_result_id=result["result_id"])
-            if not _connection_retried:
-                recovery = await self.runner.recover_connection(
-                    host, result.get("connection_generation")
-                )
-                if recovery["status"] in ("reset", "already_replaced"):
-                    retried = await self.execute(
-                        host,
-                        script,
-                        timeout,
-                        container=container,
-                        _startup_retried=True,
-                        _connection_retried=True,
-                    )
-                    return dict(
-                        retried,
-                        connection_recovery=dict(recovery, previous_result_id=result["result_id"]),
-                    )
-                result = dict(result, connection_recovery=recovery)
         return result
 
     async def close(self):
