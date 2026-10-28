@@ -86,6 +86,47 @@ class ShellSession:
         self.last_used = time.monotonic()
         self.started = False
         self.buffers = {"stdout": b"", "stderr": b""}
+        self.ready = False
+
+    async def prime(self, timeout):
+        """Confirm both streams before transmitting a private filesystem script."""
+        nonce = uuid.uuid4().hex
+        marker = b"\x1eREADY" + nonce.encode() + b"\x1f"
+
+        async def acknowledge(stream):
+            buffer = self.buffers[stream]
+            while True:
+                position = buffer.find(marker)
+                if position >= 0:
+                    self.buffers[stream] = buffer[position + len(marker) :]
+                    return
+                buffer = buffer[-(len(marker) - 1) :]
+                chunk = await getattr(self.process, stream).read(65536)
+                if not chunk:
+                    raise ConnectionError(
+                        "remote shell closed during startup; filesystem script was not sent. "
+                        "SSH authentication alone does not confirm remote execution is available; "
+                        "check the gateway execution policy and target connection"
+                    )
+                buffer += chunk
+
+        async def exchange():
+            packet = (
+                f"printf '\\036READY{nonce}\\037'; printf '\\036READY{nonce}\\037' >&2\n"
+            ).encode()
+            self.process.stdin.write(packet)
+            await self.process.stdin.drain()
+            tasks = [asyncio.create_task(acknowledge(s)) for s in ("stdout", "stderr")]
+            try:
+                await asyncio.gather(*tasks)
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+        await asyncio.wait_for(exchange(), timeout)
+        self.ready = True
 
     async def capture(self, stream, path, start, end):
         reader = getattr(self.process, stream)
@@ -350,6 +391,7 @@ class NativeSSHRunner:
         lane="general",
         queue_timeout=None,
         _internal_session=False,
+        _startup_probe=False,
     ):
         if env and any(not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) for key in env):
             raise ValueError("invalid environment variable name")
@@ -376,7 +418,7 @@ class NativeSSHRunner:
             raise ValueError("queue_timeout must be positive")
         command = self.command(container, image, docker_args, bool(session_id))
         result_id = await self.store.acreate(
-            kind="fs_worker" if _internal_session else "run",
+            kind="fs_worker" if _internal_session or _startup_probe else "run",
             host=host.name,
             asset_id=host.asset_id,
             container=container,
@@ -494,6 +536,15 @@ class NativeSSHRunner:
                             "session state was lost; "
                             "use a new session_id or call session_close to reset it"
                         )
+                    if _internal_session and not shell.ready:
+                        failure_stage = "shell_startup"
+                        try:
+                            with timing.phase("channel_seconds"):
+                                await shell.prime(min(timeout, 10))
+                        except BaseException:
+                            shell.lost = True
+                            shell.process.close()
+                            raise
                     shell.started = False
                     nonce = uuid.uuid4().hex.encode()
                     start, end = b"\x1eSTART" + nonce + b"\x1f", b"\x1eEND" + nonce + b":"
@@ -536,6 +587,16 @@ class NativeSSHRunner:
                     marker = ("__JMS_EXEC_" + uuid.uuid4().hex + "__\n").encode()
                     process, channel_reconnected = await self.open_process(host, command)
                     reconnected = reconnected or channel_reconnected
+                    if _startup_probe:
+                        failure_stage = "shell_startup"
+                        try:
+                            with timing.phase("channel_seconds"):
+                                await ShellSession(process, ()).prime(min(timeout, 10))
+                        except BaseException:
+                            process.close()
+                            with contextlib.suppress(Exception):
+                                await asyncio.wait_for(process.wait_closed(), 5)
+                            raise
                     tasks = [
                         asyncio.create_task(
                             pump(process.stdout, paths["stdout"], marker, progress)

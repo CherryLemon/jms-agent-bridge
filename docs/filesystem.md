@@ -11,7 +11,15 @@ from user-named shells and do not change the default isolation of `run`.
 Idle channels expire after 5 minutes; the pool keeps at most 16 channels, with 2
 per asset/account/container. If busy, queries use isolated execution under the
 same global concurrency limit. `discover(topic="status").filesystem_workers`
-reports reuse and saturation. A failed query is not silently replayed.
+reports reuse and saturation. New private channels must acknowledge startup on
+both output streams before any filesystem script is transmitted. If a channel
+closes during this handshake, the service retires it and tries one fresh channel.
+The original failed result remains accessible as `startup_retry_result_id`.
+A repeated startup failure returns `execution_state="not_started"`,
+`completion_unknown=false`, and `failure_stage="shell_startup"`. Successful SSH
+authentication does not establish that a gateway can start remote execution.
+There is no automatic replay after script transmission, timeout, cancellation,
+or a transfer; this recovery never switches account, protocol or approval path.
 The exploration actions are read-only. Upload/download write their destination,
 so the tool as a whole is accurately marked as potentially destructive.
 It does not change authorization scope or bypass a client/JumpServer denial.
